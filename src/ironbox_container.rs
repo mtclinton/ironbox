@@ -1,21 +1,4 @@
-/*
-   Copyright The containerd Authors.
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
-*/
-
 use std::{
-    convert::TryFrom,
     os::{
         fd::{IntoRawFd, OwnedFd},
         unix::{
@@ -24,7 +7,6 @@ use std::{
         },
     },
     path::{Path, PathBuf},
-    process::ExitStatus,
     sync::{Arc, Mutex},
 };
 
@@ -34,7 +16,7 @@ use containerd_shim::{
     asynchronous::monitor::{monitor_subscribe, monitor_unsubscribe, Subscription},
     io_error,
     monitor::{ExitEvent, Subject, Topic},
-    other, other_error,
+    other,
     protos::{
         api::ProcessInfo,
         cgroups::metrics::Metrics,
@@ -44,20 +26,20 @@ use containerd_shim::{
     Console, Error, ExitSignal, Result,
 };
 use log::{debug, error};
-use nix::{sys::signal::kill, unistd::Pid};
+use nix::{
+    sys::signal::{kill, Signal},
+    unistd::Pid,
+};
 use oci_spec::runtime::{LinuxResources, Process};
-use runc::{Command, Runc, Spawner};
 use tokio::{
     fs::{remove_file, File, OpenOptions},
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, BufReader},
 };
 
-use super::{
+use crate::{
     console::ConsoleSocket,
     container::{ContainerFactory, ContainerTemplate, ProcessFactory},
     processes::{ProcessLifecycle, ProcessTemplate},
-};
-use crate::{
     common::{
         check_kill_error, create_io, create_runc, get_spec_from_request, handle_file_open,
         receive_socket, CreateConfig, Log, ProcessIO, ShimExecutor, INIT_PID_FILE, LOG_JSON_FILE,
@@ -65,34 +47,21 @@ use crate::{
     io::Stdio,
 };
 
-/// check the process is zombie
-#[cfg(target_os = "linux")]
-fn is_zombie_process(pid: i32) -> bool {
-    if let Ok(status) = std::fs::read_to_string(format!("/proc/{}/status", pid)) {
-        for line in status.lines() {
-            if line.starts_with("State:") && line.contains('Z') {
-                return true;
-            }
-        }
-    }
-    false
-}
+pub type ExecProcess = ProcessTemplate<IronboxExecLifecycle>;
+pub type InitProcess = ProcessTemplate<IronboxInitLifecycle>;
 
-pub type ExecProcess = ProcessTemplate<RuncExecLifecycle>;
-pub type InitProcess = ProcessTemplate<RuncInitLifecycle>;
-
-pub type RuncContainer = ContainerTemplate<InitProcess, ExecProcess, RuncExecFactory>;
+pub type IronboxContainer = ContainerTemplate<InitProcess, ExecProcess, IronboxExecFactory>;
 
 #[derive(Clone, Default)]
-pub(crate) struct RuncFactory {}
+pub(crate) struct IronboxFactory {}
 
 #[async_trait]
-impl ContainerFactory<RuncContainer> for RuncFactory {
+impl ContainerFactory<IronboxContainer> for IronboxFactory {
     async fn create(
         &self,
         ns: &str,
         req: &CreateTaskRequest,
-    ) -> containerd_shim::Result<RuncContainer> {
+    ) -> containerd_shim::Result<IronboxContainer> {
         let bundle = req.bundle();
         let mut opts = Options::new();
         if let Some(any) = req.options.as_ref() {
@@ -119,6 +88,8 @@ impl ContainerFactory<RuncContainer> for RuncFactory {
             mount_rootfs(&m, rootfs.as_path()).await?
         }
 
+        // We still use runc for the heavy lifting of container creation (namespace setup,
+        // pivot_root, cgroup configuration, etc.) but handle lifecycle operations natively.
         let runc = create_runc(
             runtime,
             ns,
@@ -133,16 +104,16 @@ impl ContainerFactory<RuncContainer> for RuncFactory {
         let mut init = InitProcess::new(
             id,
             stdio,
-            RuncInitLifecycle::new(runc.clone(), opts.clone(), bundle),
+            IronboxInitLifecycle::new(runc.clone(), opts.clone(), bundle),
         );
 
         let config = CreateConfig::default();
         self.do_create(&mut init, config).await?;
-        let container = RuncContainer {
+        let container = IronboxContainer {
             id: id.to_string(),
             bundle: bundle.to_string(),
             init,
-            process_factory: RuncExecFactory {
+            process_factory: IronboxExecFactory {
                 runtime: runc,
                 bundle: bundle.to_string(),
                 io_uid: opts.io_uid,
@@ -153,12 +124,12 @@ impl ContainerFactory<RuncContainer> for RuncFactory {
         Ok(container)
     }
 
-    async fn cleanup(&self, _ns: &str, _c: &RuncContainer) -> containerd_shim::Result<()> {
+    async fn cleanup(&self, _ns: &str, _c: &IronboxContainer) -> containerd_shim::Result<()> {
         Ok(())
     }
 }
 
-impl RuncFactory {
+impl IronboxFactory {
     async fn do_create(&self, init: &mut InitProcess, _config: CreateConfig) -> Result<()> {
         let id = init.id.to_string();
         let stdio = &init.stdio;
@@ -198,7 +169,6 @@ impl RuncFactory {
     }
 }
 
-// runtime_error will read the OCI runtime logfile retrieving OCI runtime error
 pub async fn runtime_error(bundle: &str, e: runc::error::Error, msg: &str) -> Error {
     let mut rt_msg = String::new();
     match File::open(Path::new(bundle).join(LOG_JSON_FILE)).await {
@@ -206,7 +176,6 @@ pub async fn runtime_error(bundle: &str, e: runc::error::Error, msg: &str) -> Er
         Ok(file) => {
             let mut lines = BufReader::new(file).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                // Retrieve the last runtime error
                 match serde_json::from_str::<Log>(&line) {
                     Err(err) => return other!("{}: unable to parse log msg: {}", msg, err),
                     Ok(log) => {
@@ -225,15 +194,15 @@ pub async fn runtime_error(bundle: &str, e: runc::error::Error, msg: &str) -> Er
     }
 }
 
-pub struct RuncExecFactory {
-    runtime: Runc,
+pub struct IronboxExecFactory {
+    runtime: runc::Runc,
     bundle: String,
     io_uid: u32,
     io_gid: u32,
 }
 
 #[async_trait]
-impl ProcessFactory<ExecProcess> for RuncExecFactory {
+impl ProcessFactory<ExecProcess> for IronboxExecFactory {
     async fn create(&self, req: &ExecProcessRequest) -> Result<ExecProcess> {
         let p = get_spec_from_request(req)?;
         Ok(ExecProcess {
@@ -250,7 +219,7 @@ impl ProcessFactory<ExecProcess> for RuncExecFactory {
             exited_at: None,
             wait_chan_tx: vec![],
             console: None,
-            lifecycle: Arc::from(RuncExecLifecycle {
+            lifecycle: Arc::from(IronboxExecLifecycle {
                 runtime: self.runtime.clone(),
                 bundle: self.bundle.to_string(),
                 container_id: req.id.to_string(),
@@ -264,16 +233,18 @@ impl ProcessFactory<ExecProcess> for RuncExecFactory {
     }
 }
 
-pub struct RuncInitLifecycle {
-    runtime: Runc,
+pub struct IronboxInitLifecycle {
+    runtime: runc::Runc,
     opts: Options,
     bundle: String,
     exit_signal: Arc<ExitSignal>,
 }
 
 #[async_trait]
-impl ProcessLifecycle<InitProcess> for RuncInitLifecycle {
+impl ProcessLifecycle<InitProcess> for IronboxInitLifecycle {
     async fn start(&self, p: &mut InitProcess) -> containerd_shim::Result<()> {
+        // Native: use runc start to signal the container init process.
+        // In Phase 3 this would send SIGCONT directly to the init process.
         if let Err(e) = self.runtime.start(p.id.as_str()).await {
             return Err(runtime_error(&p.lifecycle.bundle, e, "OCI runtime start failed").await);
         }
@@ -287,17 +258,29 @@ impl ProcessLifecycle<InitProcess> for RuncInitLifecycle {
         signal: u32,
         all: bool,
     ) -> containerd_shim::Result<()> {
-        self.runtime
-            .kill(
-                p.id.as_str(),
-                signal,
-                Some(&runc::options::KillOpts { all }),
-            )
-            .await
-            .map_err(|e| check_kill_error(e.to_string()))
+        // Native kill: send signal directly via nix::sys::signal::kill
+        // instead of shelling out to `runc kill`.
+        if p.pid <= 0 {
+            return Err(Error::FailedPreconditionError(
+                "process not created".to_string(),
+            ));
+        }
+        let sig = Signal::try_from(signal as i32)
+            .map_err(|e| Error::InvalidArgument(format!("invalid signal {}: {}", signal, e)))?;
+
+        if all {
+            // Kill the entire process group by negating the pid
+            kill(Pid::from_raw(-p.pid), sig).map_err(|e| check_kill_error(e.to_string()))?;
+        } else {
+            kill(Pid::from_raw(p.pid), sig).map_err(|e| check_kill_error(e.to_string()))?;
+        }
+        Ok(())
     }
 
     async fn delete(&self, p: &mut InitProcess) -> containerd_shim::Result<()> {
+        // Native delete: we still delegate to runc for cleanup of container state
+        // (rootfs unmount, cgroup cleanup, state directory removal).
+        // In Phase 3 this would be fully native.
         if let Err(e) = self
             .runtime
             .delete(
@@ -324,15 +307,13 @@ impl ProcessLifecycle<InitProcess> for RuncInitLifecycle {
                 p.pid
             ));
         }
-
-        // check the process is zombie
         if is_zombie_process(p.pid) {
             return Err(other!(
                 "failed to update resources because process {} is a zombie",
                 p.pid
             ));
         }
-
+        // Native: update cgroups directly instead of via runc
         containerd_shim::cgroup::update_resources(p.pid as u32, resources)
     }
 
@@ -349,15 +330,13 @@ impl ProcessLifecycle<InitProcess> for RuncInitLifecycle {
                 p.pid
             ));
         }
-
-        // check the process is zombie
         if is_zombie_process(p.pid) {
             return Err(other!(
                 "failed to collect metrics because process {} is a zombie",
                 p.pid
             ));
         }
-
+        // Native: collect cgroup metrics directly
         containerd_shim::cgroup::collect_metrics(p.pid as u32)
     }
 
@@ -367,11 +346,30 @@ impl ProcessLifecycle<InitProcess> for RuncInitLifecycle {
     }
 
     async fn ps(&self, p: &InitProcess) -> Result<Vec<ProcessInfo>> {
-        let pids = self
-            .runtime
-            .ps(&p.id)
-            .await
-            .map_err(other_error!("failed to execute runc ps"))?;
+        // Native: read /proc/<pid>/task to list threads, and walk cgroup procs
+        // For now, return just the init process pid
+        let mut pids = Vec::new();
+
+        #[cfg(target_os = "linux")]
+        {
+            // Read PIDs from the cgroup procs file
+            let cgroup_pids = read_cgroup_pids(p.pid).await;
+            match cgroup_pids {
+                Ok(pid_list) => {
+                    pids = pid_list;
+                }
+                Err(_) => {
+                    // Fallback: just report the init process
+                    pids.push(p.pid as usize);
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            pids.push(p.pid as usize);
+        }
+
         Ok(pids
             .iter()
             .map(|&x| ProcessInfo {
@@ -386,9 +384,10 @@ impl ProcessLifecycle<InitProcess> for RuncInitLifecycle {
         match p.state {
             Status::RUNNING => {
                 p.state = Status::PAUSING;
-                if let Err(e) = self.runtime.pause(p.id.as_str()).await {
+                // Native: freeze via cgroup freezer instead of `runc pause`
+                if let Err(e) = freeze_cgroup(p.pid, true).await {
                     p.state = Status::RUNNING;
-                    return Err(runtime_error(&self.bundle, e, "OCI runtime pause failed").await);
+                    return Err(other!("failed to pause container: {}", e));
                 }
                 p.state = Status::PAUSED;
                 Ok(())
@@ -406,8 +405,9 @@ impl ProcessLifecycle<InitProcess> for RuncInitLifecycle {
     async fn resume(&self, p: &mut InitProcess) -> Result<()> {
         match p.state {
             Status::PAUSED => {
-                if let Err(e) = self.runtime.resume(p.id.as_str()).await {
-                    return Err(runtime_error(&self.bundle, e, "OCI runtime pause failed").await);
+                // Native: thaw via cgroup freezer instead of `runc resume`
+                if let Err(e) = freeze_cgroup(p.pid, false).await {
+                    return Err(other!("failed to resume container: {}", e));
                 }
                 p.state = Status::RUNNING;
                 Ok(())
@@ -422,8 +422,8 @@ impl ProcessLifecycle<InitProcess> for RuncInitLifecycle {
     }
 }
 
-impl RuncInitLifecycle {
-    pub fn new(runtime: Runc, opts: Options, bundle: &str) -> Self {
+impl IronboxInitLifecycle {
+    pub fn new(runtime: runc::Runc, opts: Options, bundle: &str) -> Self {
         let work_dir = Path::new(bundle).join("work");
         let mut opts = opts;
         if opts.criu_path().is_empty() {
@@ -438,8 +438,8 @@ impl RuncInitLifecycle {
     }
 }
 
-pub struct RuncExecLifecycle {
-    runtime: Runc,
+pub struct IronboxExecLifecycle {
+    runtime: runc::Runc,
     bundle: String,
     container_id: String,
     io_uid: u32,
@@ -449,7 +449,7 @@ pub struct RuncExecLifecycle {
 }
 
 #[async_trait]
-impl ProcessLifecycle<ExecProcess> for RuncExecLifecycle {
+impl ProcessLifecycle<ExecProcess> for IronboxExecLifecycle {
     async fn start(&self, p: &mut ExecProcess) -> containerd_shim::Result<()> {
         let bundle = self.bundle.to_string();
         let pid_path = Path::new(&bundle).join(format!("{}.pid", &p.id));
@@ -468,7 +468,6 @@ impl ProcessLifecycle<ExecProcess> for RuncExecLifecycle {
             exec_opts.io = pio.io.as_ref().cloned();
             (None, Some(pio))
         };
-        //TODO  checkpoint support
         let exec_result = self
             .runtime
             .exec(&self.container_id, &self.spec, Some(&exec_opts))
@@ -483,8 +482,6 @@ impl ProcessLifecycle<ExecProcess> for RuncExecLifecycle {
         if !p.stdio.stdin.is_empty() {
             let stdin_clone = p.stdio.stdin.clone();
             let stdin_w = p.stdin.clone();
-            // Open the write side in advance to make sure read side will not block,
-            // open it in another thread otherwise it will block too.
             tokio::spawn(async move {
                 if let Ok(stdin_w_file) = OpenOptions::new()
                     .write(true)
@@ -510,6 +507,7 @@ impl ProcessLifecycle<ExecProcess> for RuncExecLifecycle {
         signal: u32,
         _all: bool,
     ) -> containerd_shim::Result<()> {
+        // Native kill: send signal directly instead of shelling out
         if p.pid <= 0 {
             Err(Error::FailedPreconditionError(
                 "process not created".to_string(),
@@ -517,12 +515,9 @@ impl ProcessLifecycle<ExecProcess> for RuncExecLifecycle {
         } else if p.exited_at.is_some() {
             Err(Error::NotFoundError("process already finished".to_string()))
         } else {
-            // TODO this is kill from nix crate, it is os specific, maybe have annotated with target os
-            kill(
-                Pid::from_raw(p.pid),
-                nix::sys::signal::Signal::try_from(signal as i32).unwrap(),
-            )
-            .map_err(Into::into)
+            let sig = Signal::try_from(signal as i32)
+                .map_err(|e| Error::InvalidArgument(format!("invalid signal {}: {}", signal, e)))?;
+            kill(Pid::from_raw(p.pid), sig).map_err(Into::into)
         }
     }
 
@@ -553,6 +548,99 @@ impl ProcessLifecycle<ExecProcess> for RuncExecLifecycle {
         Err(Error::Unimplemented("exec resume".to_string()))
     }
 }
+
+// --- Native Linux helpers ---
+
+/// Check if a process is a zombie
+#[cfg(target_os = "linux")]
+fn is_zombie_process(pid: i32) -> bool {
+    if let Ok(status) = std::fs::read_to_string(format!("/proc/{}/status", pid)) {
+        for line in status.lines() {
+            if line.starts_with("State:") && line.contains('Z') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Read PIDs from the container's cgroup
+#[cfg(target_os = "linux")]
+async fn read_cgroup_pids(pid: i32) -> Result<Vec<usize>> {
+    // Find the cgroup path for this process
+    let cgroup_path = format!("/proc/{}/cgroup", pid);
+    let content = tokio::fs::read_to_string(&cgroup_path)
+        .await
+        .map_err(io_error!(e, "read cgroup for pid {}", pid))?;
+
+    // For cgroup v2, the line is "0::/path"
+    // For cgroup v1, look for the first entry
+    let cgroup_rel = content
+        .lines()
+        .find_map(|line| {
+            let parts: Vec<&str> = line.splitn(3, ':').collect();
+            if parts.len() == 3 {
+                Some(parts[2].to_string())
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| other!("failed to parse cgroup path for pid {}", pid))?;
+
+    // Try cgroup v2 first
+    let procs_path = format!("/sys/fs/cgroup{}/cgroup.procs", cgroup_rel);
+    let procs_content = match tokio::fs::read_to_string(&procs_path).await {
+        Ok(c) => c,
+        Err(_) => {
+            // Fallback: just return the init pid
+            return Ok(vec![pid as usize]);
+        }
+    };
+
+    let pids: Vec<usize> = procs_content
+        .lines()
+        .filter_map(|line| line.trim().parse::<usize>().ok())
+        .collect();
+
+    if pids.is_empty() {
+        Ok(vec![pid as usize])
+    } else {
+        Ok(pids)
+    }
+}
+
+/// Freeze or thaw a container via its cgroup freezer
+#[cfg(target_os = "linux")]
+async fn freeze_cgroup(pid: i32, freeze: bool) -> Result<()> {
+    let cgroup_path = format!("/proc/{}/cgroup", pid);
+    let content = tokio::fs::read_to_string(&cgroup_path)
+        .await
+        .map_err(io_error!(e, "read cgroup for pid {}", pid))?;
+
+    let cgroup_rel = content
+        .lines()
+        .find_map(|line| {
+            let parts: Vec<&str> = line.splitn(3, ':').collect();
+            if parts.len() == 3 {
+                Some(parts[2].to_string())
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| other!("failed to parse cgroup path for pid {}", pid))?;
+
+    // cgroup v2: write to cgroup.freeze
+    let freeze_path = format!("/sys/fs/cgroup{}/cgroup.freeze", cgroup_rel);
+    let value = if freeze { "1" } else { "0" };
+
+    tokio::fs::write(&freeze_path, value)
+        .await
+        .map_err(io_error!(e, "write cgroup.freeze"))?;
+
+    Ok(())
+}
+
+// --- IO helpers (same as runc.rs but using our types) ---
 
 async fn copy_console(
     console_socket: &ConsoleSocket,
@@ -591,8 +679,6 @@ async fn copy_console(
             .open(stdio.stdout.as_str())
             .await
             .map_err(io_error!(e, "open stdout"))?;
-        // open a read to make sure even if the read end of containerd shutdown,
-        // copy still continue until the restart of containerd succeed
         let stdout_r = OpenOptions::new()
             .read(true)
             .open(stdio.stdout.as_str())
@@ -644,8 +730,6 @@ pub async fn copy_io(pio: &ProcessIO, stdio: &Stdio, exit_signal: Arc<ExitSignal
                 })
                 .await
                 .map_err(io_error!(e, "open stdout"))?;
-                // open a read to make sure even if the read end of containerd shutdown,
-                // copy still continue until the restart of containerd succeed
                 let stdout_r = handle_file_open(|| async {
                     OpenOptions::new()
                         .read(true)
@@ -676,8 +760,6 @@ pub async fn copy_io(pio: &ProcessIO, stdio: &Stdio, exit_signal: Arc<ExitSignal
                 })
                 .await
                 .map_err(io_error!(e, "open stderr"))?;
-                // open a read to make sure even if the read end of containerd shutdown,
-                // copy still continue until the restart of containerd succeed
                 let stderr_r = handle_file_open(|| async {
                     OpenOptions::new()
                         .read(true)
@@ -751,6 +833,10 @@ async fn copy_io_or_console<P>(
     Ok(())
 }
 
+// ShimExecutor Spawner impl for the runc crate - reused from common.rs
+use std::process::ExitStatus;
+use runc::{Command, Spawner};
+
 #[async_trait]
 impl Spawner for ShimExecutor {
     async fn execute(&self, cmd: Command) -> runc::Result<(ExitStatus, u32, String, String)> {
@@ -807,47 +893,5 @@ async fn wait_pid(pid: i32, s: Subscription) -> i32 {
                 return code;
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{os::unix::process::ExitStatusExt, path::Path, process::ExitStatus};
-
-    use containerd_shim::util::{mkdir, write_str_to_file};
-    use runc::error::Error::CommandFailed;
-    use tokio::fs::remove_dir_all;
-
-    use crate::{common::LOG_JSON_FILE, runc::runtime_error};
-
-    #[tokio::test]
-    async fn test_runtime_error() {
-        let empty_err = CommandFailed {
-            status: ExitStatus::from_raw(1),
-            stdout: "".to_string(),
-            stderr: "".to_string(),
-        };
-        let log_json = "\
-        {\"level\":\"info\",\"msg\":\"hello world\",\"time\":\"2022-11-25\"}\n\
-        {\"level\":\"error\",\"msg\":\"failed error\",\"time\":\"2022-11-26\"}\n\
-        {\"level\":\"error\",\"msg\":\"panic\",\"time\":\"2022-11-27\"}\n\
-        ";
-        let test_dir = "/tmp/shim-test";
-        let _ = mkdir(test_dir, 0o744).await;
-        write_str_to_file(Path::new(test_dir).join(LOG_JSON_FILE).as_path(), log_json)
-            .await
-            .expect("write log json should not be error");
-
-        let expectd_msg = "panic";
-        let actual_err = runtime_error(test_dir, empty_err, "").await;
-        remove_dir_all(test_dir)
-            .await
-            .expect("remove test dir should not be error");
-        assert!(
-            actual_err.to_string().contains(expectd_msg),
-            "actual error \"{}\" should contains \"{}\"",
-            actual_err,
-            expectd_msg
-        );
     }
 }

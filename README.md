@@ -13,9 +13,25 @@
 ## What is ironbox?
 
 **ironbox** is a [containerd](https://containerd.io/) shim runtime built in Rust.
-It implements the containerd shim v2 API, currently delegating container lifecycle operations to [runc](https://github.com/opencontainers/runc) via the [containerd rust-extensions](https://github.com/containerd/rust-extensions) crates.
+It implements the containerd shim v2 API with its own `IronboxFactory` and `IronboxContainer` types that handle container lifecycle operations natively where possible, falling back to [runc](https://github.com/opencontainers/runc) for container creation.
 
 The goal is to incrementally replace runc with a native Rust OCI runtime, learning the container stack from the shim layer down to namespaces, cgroups, and `pivot_root`.
+
+## Architecture
+
+ironbox uses custom container and process lifecycle types instead of wrapping the runc binary for every operation:
+
+| Operation | Implementation |
+|-----------|---------------|
+| **kill** | Native &mdash; sends signals directly via `kill(2)` syscall |
+| **pause/resume** | Native &mdash; writes to cgroup v2 `cgroup.freeze` |
+| **stats** | Native &mdash; reads cgroup metrics directly |
+| **update** | Native &mdash; writes cgroup resource limits directly |
+| **ps** | Native &mdash; reads PIDs from `cgroup.procs` |
+| **create** | Delegates to runc (namespace setup, `pivot_root`, mounts) |
+| **start** | Delegates to runc (signals init process) |
+| **exec** | Delegates to runc (`nsenter` into existing namespaces) |
+| **delete** | Delegates to runc (state + rootfs cleanup) |
 
 ## How do I use it?
 
@@ -68,22 +84,22 @@ All contributions are welcome!
 Some ways to contribute include:
 
 - Testing on different Linux distributions and reporting issues.
-- Implementing native OCI runtime operations to replace the runc dependency.
+- Implementing native replacements for the remaining runc-delegated operations.
 - Adding support for additional container features (checkpointing, lazy pulling, etc.).
 - Improving documentation and examples.
 
 ## Project roadmap
 
-- **Phase 1** (current): Standalone containerd shim that delegates to runc.
-- **Phase 2**: Replace `RuncFactory`/`RuncContainer` with custom Rust implementations.
-- **Phase 3**: Build a minimal OCI runtime binary (`create`, `start`, `delete`, `state`) using namespaces, cgroups, and `pivot_root` directly.
+- **Phase 1**: Standalone containerd shim that delegates to runc.
+- **Phase 2** (current): Custom `IronboxFactory`/`IronboxContainer` types with native signal handling, cgroup management, and process listing.
+- **Phase 3**: Build a minimal OCI runtime binary (`create`, `start`, `delete`, `state`) using namespaces, cgroups, and `pivot_root` directly, removing the runc dependency entirely.
 
 ## Dependencies
 
 ironbox builds on top of the [containerd rust-extensions](https://github.com/containerd/rust-extensions) project:
 
 - [`containerd-shim`](https://github.com/containerd/rust-extensions/tree/main/crates/shim) - Shim v2 API and TTRPC server
-- [`runc`](https://github.com/containerd/rust-extensions/tree/main/crates/runc) - Rust client for the runc binary
+- [`runc`](https://github.com/containerd/rust-extensions/tree/main/crates/runc) - Rust client for the runc binary (used for container creation)
 
 ## What does "ironbox" mean?
 

@@ -24,8 +24,8 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 use crate::{
     common::{create_runc, has_shared_pid_namespace, ShimExecutor, GROUP_LABELS, INIT_PID_FILE},
     container::Container,
+    ironbox_container::{IronboxContainer, IronboxFactory},
     processes::Process,
-    runc::{RuncContainer, RuncFactory},
     task::TaskService,
 };
 
@@ -37,7 +37,7 @@ pub(crate) struct Service {
 
 #[async_trait]
 impl Shim for Service {
-    type T = TaskService<RuncFactory, RuncContainer>;
+    type T = TaskService<IronboxFactory, IronboxContainer>;
 
     async fn new(_runtime_id: &str, args: &Flags, _config: &mut Config) -> Self {
         let exit = Arc::new(ExitSignal::default());
@@ -126,7 +126,7 @@ impl Shim for Service {
 
 async fn process_exits(
     s: Subscription,
-    task: &TaskService<RuncFactory, RuncContainer>,
+    task: &TaskService<IronboxFactory, IronboxContainer>,
     tx: Sender<(String, Box<dyn MessageDyn>)>,
 ) {
     let containers = task.containers.clone();

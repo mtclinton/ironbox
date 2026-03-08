@@ -1,0 +1,32 @@
+[package]
+name = "ironbox"
+version = "0.1.0"
+edition = "2021"
+description = "A containerd shim runtime built in Rust"
+license = "Apache-2.0"
+
+[[bin]]
+name = "containerd-shim-ironbox-v1"
+path = "src/main.rs"
+
+[dependencies]
+containerd-shim = { path = "../rust-extensions/crates/shim", version = "0.8.0", features = ["async"] }
+runc = { path = "../rust-extensions/crates/runc", version = "0.3.0", features = ["async"] }
+
+libc = "0.2"
+log = { version = "0.4", features = ["std", "kv_unstable"] }
+nix = { version = "0.29", features = ["socket", "uio", "term"] }
+oci-spec = "0.7"
+prctl = "1.0.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+time = { version = "0.3", features = ["serde", "std", "formatting"] }
+uuid = { version = "1.0", features = ["v4"] }
+
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cgroups-rs = "0.3.4"
+nix = { version = "0.29", features = ["socket", "uio", "term", "event"] }
+tokio-eventfd = "0.2.1"

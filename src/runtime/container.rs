@@ -18,7 +18,10 @@ use nix::{
 use oci_spec::runtime::Spec;
 
 use super::{
+    capabilities::apply_capabilities,
+    cgroup::{add_process_to_cgroup, create_cgroup, delete_cgroup},
     namespace::setup_namespaces,
+    network::setup_loopback,
     rootfs::{cleanup_rootfs, pivot_root, setup_default_devices, setup_mounts, setup_rootfs},
 };
 
@@ -38,6 +41,8 @@ pub struct ContainerProcess {
     pub start_pipe: OwnedFd,
     /// The rootfs path (for cleanup).
     pub rootfs: PathBuf,
+    /// The cgroup path (for cleanup and resource management).
+    pub cgroup_path: PathBuf,
 }
 
 /// Create a new container from an OCI bundle.
@@ -103,6 +108,8 @@ pub fn create_container(
     let (ready_rd, ready_wr) = pipe()?;
     // error_pipe: child writes error messages → parent reads
     let (err_rd, err_wr) = pipe()?;
+    // pid_pipe: middle process writes grandchild PID → parent reads
+    let (pid_rd, pid_wr) = pipe()?;
 
     debug!("create_container: forking for container {}", id);
 
@@ -117,6 +124,7 @@ pub fn create_container(
         drop(init_wr);
         drop(ready_rd);
         drop(err_rd);
+        drop(pid_rd);
 
         // Redirect stdio to the containerd FIFOs
         if let Some(ref f) = stdin_fd {
@@ -140,7 +148,7 @@ pub fn create_container(
         drop(stderr_fd);
 
         // Run child setup; if anything fails, write error to err_pipe and exit
-        let result = child_setup(spec, &rootfs_path, init_rd, ready_wr);
+        let result = child_setup(spec, &rootfs_path, init_rd, ready_wr, pid_wr);
         if let Err(e) = result {
             let msg = format!("{}", e);
             let _ = nix::unistd::write(&err_wr, msg.as_bytes());
@@ -156,11 +164,27 @@ pub fn create_container(
     drop(init_rd);
     drop(ready_wr);
     drop(err_wr);
+    drop(pid_wr);
     drop(stdin_fd);
     drop(stdout_fd);
     drop(stderr_fd);
 
-    debug!("create_container: forked child pid={}", pid);
+    debug!("create_container: forked middle process pid={}", pid);
+
+    // Read the grandchild (init) PID from the pid pipe
+    let mut pid_buf = [0u8; 32];
+    let mut pid_file_inner = unsafe { fs::File::from_raw_fd(pid_rd.as_raw_fd()) };
+    std::mem::forget(pid_rd);
+    let n = pid_file_inner
+        .read(&mut pid_buf)
+        .map_err(|e| other!("read grandchild pid: {}", e))?;
+    let init_pid: i32 = std::str::from_utf8(&pid_buf[..n])
+        .map_err(|e| other!("parse grandchild pid: {}", e))?
+        .trim()
+        .parse()
+        .map_err(|e| other!("parse grandchild pid int: {}", e))?;
+
+    debug!("create_container: grandchild (init) pid={}", init_pid);
 
     // Wait for child to signal ready (or error)
     let mut ready_buf = [0u8; 1];
@@ -192,16 +216,21 @@ pub fn create_container(
         }
     }
 
-    // Write PID file
-    fs::write(pid_file, pid.to_string())
+    // Create cgroup and add the init process (grandchild) to it
+    let cgroup_path = create_cgroup(id, spec)?;
+    add_process_to_cgroup(&cgroup_path, init_pid)?;
+
+    // Write init PID file (the grandchild, not the middle process)
+    fs::write(pid_file, init_pid.to_string())
         .map_err(|e| other!("write pid file: {}", e))?;
 
-    debug!("create_container: container {} created with pid {}", id, pid);
+    debug!("create_container: container {} created with init_pid={}", id, init_pid);
 
     Ok(ContainerProcess {
-        pid,
+        pid: init_pid,
         start_pipe: init_wr,
         rootfs: rootfs_path,
+        cgroup_path,
     })
 }
 
@@ -211,29 +240,63 @@ fn child_setup(
     rootfs: &Path,
     init_pipe_rd: OwnedFd,
     ready_pipe_wr: OwnedFd,
+    pid_pipe_wr: OwnedFd,
 ) -> Result<()> {
     // 1. Set up namespaces (unshare)
     setup_namespaces(spec)?;
 
-    // 2. Set hostname if UTS namespace is being created
+    // 2. Double-fork for PID namespace.
+    // After unshare(CLONE_NEWPID), the next fork's child will be PID 1 in the new namespace.
+    let grandchild_pid = unsafe { libc::fork() };
+    if grandchild_pid < 0 {
+        return Err(other!("double-fork failed: {}", std::io::Error::last_os_error()));
+    }
+    if grandchild_pid > 0 {
+        // Middle process: write grandchild PID to parent, then wait for grandchild
+        let pid_str = grandchild_pid.to_string();
+        let _ = nix::unistd::write(&pid_pipe_wr, pid_str.as_bytes());
+        drop(pid_pipe_wr);
+        drop(init_pipe_rd);
+        drop(ready_pipe_wr);
+
+        let mut status = 0i32;
+        unsafe { libc::waitpid(grandchild_pid, &mut status, 0) };
+        let code = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else if libc::WIFSIGNALED(status) {
+            128 + libc::WTERMSIG(status)
+        } else {
+            1
+        };
+        unsafe { libc::_exit(code) };
+    }
+
+    // === GRANDCHILD — now PID 1 in the new PID namespace ===
+    drop(pid_pipe_wr);
+
+    // 3. Bring up loopback interface (before pivoting rootfs, while /proc is accessible)
+    // Best-effort: don't fail the whole container if lo setup fails
+    let _ = setup_loopback();
+
+    // 4. Set hostname if UTS namespace is being created
     if let Some(hostname) = spec.hostname() {
         nix::unistd::sethostname(hostname)
             .map_err(|e| other!("sethostname: {}", e))?;
     }
 
-    // 3. Set up rootfs
+    // 4. Set up rootfs
     setup_rootfs(rootfs)?;
 
-    // 4. Pivot root
+    // 5. Pivot root
     pivot_root(rootfs)?;
 
-    // 5. Set up remaining mounts (proc, sysfs, etc.) — these are inside the new root
+    // 6. Set up remaining mounts (proc, sysfs, etc.) — these are inside the new root
     setup_mounts(spec)?;
 
-    // 6. Create default devices
+    // 7. Create default devices
     setup_default_devices()?;
 
-    // 7. Set up process attributes from spec
+    // 8. Set up process attributes from spec
     if let Some(process) = spec.process() {
         // Set working directory
         if let Some(cwd) = process.cwd().to_str() {
@@ -290,17 +353,20 @@ fn child_setup(
         }
     }
 
-    // 8. Signal parent that setup is complete
+    // 9. Drop capabilities per OCI spec
+    apply_capabilities(spec)?;
+
+    // 10. Signal parent that setup is complete
     let _ = nix::unistd::write(&ready_pipe_wr, b"R");
     drop(ready_pipe_wr);
 
-    // 9. Block waiting for start signal
+    // 11. Block waiting for start signal
     let mut buf = [0u8; 1];
     let mut init_file = unsafe { fs::File::from_raw_fd(init_pipe_rd.as_raw_fd()) };
     std::mem::forget(init_pipe_rd);
     let _ = init_file.read_exact(&mut buf);
 
-    // 10. Exec the container process
+    // 12. Exec the container process
     exec_container_process(spec)?;
 
     // Should not reach here
@@ -345,47 +411,20 @@ pub fn start_container(start_pipe: &OwnedFd) -> Result<()> {
 }
 
 /// Delete a container: kill all processes, clean up cgroup, unmount rootfs.
-pub fn delete_container(pid: i32, rootfs: &Path, force: bool) -> Result<()> {
+pub fn delete_container(pid: i32, rootfs: &Path, cgroup_path: &Path, force: bool) -> Result<()> {
     if force && pid > 0 {
-        // Kill the init process and all children via cgroup
-        kill_container_processes(pid);
+        let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+    }
+
+    // Clean up cgroup (kills remaining processes too)
+    if cgroup_path.exists() {
+        let _ = delete_cgroup(cgroup_path);
     }
 
     // Unmount rootfs (best effort)
     let _ = cleanup_rootfs(rootfs);
 
     Ok(())
-}
-
-/// Kill all processes in a container's cgroup, then the init process.
-fn kill_container_processes(pid: i32) {
-    // Try to read PIDs from cgroup
-    if let Ok(cgroup_content) = fs::read_to_string(format!("/proc/{}/cgroup", pid)) {
-        if let Some(cgroup_rel) = cgroup_content.lines().find_map(|line| {
-            let parts: Vec<&str> = line.splitn(3, ':').collect();
-            if parts.len() == 3 {
-                Some(parts[2].to_string())
-            } else {
-                None
-            }
-        }) {
-            let procs_path = format!("/sys/fs/cgroup{}/cgroup.procs", cgroup_rel);
-            if let Ok(procs) = fs::read_to_string(&procs_path) {
-                for line in procs.lines() {
-                    if let Ok(p) = line.trim().parse::<i32>() {
-                        let _ = kill(Pid::from_raw(p), Signal::SIGKILL);
-                    }
-                }
-            }
-
-            // Clean up the cgroup directory
-            let cgroup_dir = format!("/sys/fs/cgroup{}", cgroup_rel);
-            let _ = fs::remove_dir(&cgroup_dir);
-        }
-    }
-
-    // Also directly kill the init process
-    let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
 }
 
 /// Resolve the rootfs path from the bundle and OCI spec.

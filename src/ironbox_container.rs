@@ -141,6 +141,7 @@ impl IronboxFactory {
         {
             *init.lifecycle.start_pipe.lock().unwrap() = Some(container_process.start_pipe);
             *init.lifecycle.rootfs.lock().unwrap() = Some(container_process.rootfs);
+            *init.lifecycle.cgroup_path.lock().unwrap() = Some(container_process.cgroup_path);
             *init.lifecycle.container_pid.lock().unwrap() = container_process.pid;
         }
 
@@ -192,6 +193,7 @@ pub struct IronboxInitLifecycle {
     exit_signal: Arc<ExitSignal>,
     start_pipe: StdMutex<Option<OwnedFd>>,
     rootfs: StdMutex<Option<PathBuf>>,
+    cgroup_path: StdMutex<Option<PathBuf>>,
     container_pid: StdMutex<i32>,
 }
 
@@ -232,10 +234,11 @@ impl ProcessLifecycle<InitProcess> for IronboxInitLifecycle {
     }
 
     async fn delete(&self, p: &mut InitProcess) -> containerd_shim::Result<()> {
-        // Native delete: kill processes, unmount rootfs, clean up
+        // Native delete: kill processes, unmount rootfs, clean up cgroup
         let rootfs = self.rootfs.lock().unwrap().clone().unwrap_or_default();
+        let cgroup_path = self.cgroup_path.lock().unwrap().clone().unwrap_or_default();
         let pid = p.pid;
-        if let Err(e) = asyncify(move || delete_container(pid, &rootfs, true)).await {
+        if let Err(e) = asyncify(move || delete_container(pid, &rootfs, &cgroup_path, true)).await {
             warn!("delete container cleanup: {}", e);
         }
         self.exit_signal.signal();
@@ -365,6 +368,7 @@ impl IronboxInitLifecycle {
             exit_signal: Default::default(),
             start_pipe: StdMutex::new(None),
             rootfs: StdMutex::new(None),
+            cgroup_path: StdMutex::new(None),
             container_pid: StdMutex::new(0),
         }
     }

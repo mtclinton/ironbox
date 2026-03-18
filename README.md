@@ -15,17 +15,17 @@
 **ironbox** is a [containerd](https://containerd.io/) shim runtime built in Rust.
 It implements the containerd shim v2 API with a native OCI runtime that manages container lifecycles using Linux syscalls directly &mdash; no dependency on the runc binary.
 
-Container creation uses `fork(2)`, `unshare(2)`, `pivot_root(2)`, and `mount(2)` to set up isolated namespaces and a new root filesystem. Process exec joins existing namespaces via `setns(2)`. Signals, cgroup management, and process listing are all handled natively.
+Container creation uses `fork(2)`, `unshare(2)`, `pivot_root(2)`, and `mount(2)` to set up isolated namespaces and a new root filesystem. A double-fork ensures the container init process is PID 1. Process exec joins existing namespaces via `setns(2)`. Cgroup v2 resource limits, capability dropping, and loopback networking are all handled natively.
 
 ## Architecture
 
 | Operation | Implementation |
 |-----------|---------------|
-| **create** | Native &mdash; `fork`, `unshare` namespaces, `pivot_root`, OCI spec mounts, sync pipe for lifecycle |
-| **start** | Native &mdash; writes to sync pipe, init process execs the container entrypoint |
+| **create** | Native &mdash; double-fork, `unshare` namespaces, `pivot_root`, OCI mounts, cgroup v2 setup, capability drop, loopback up |
+| **start** | Native &mdash; writes to sync pipe, init process (PID 1) execs the entrypoint |
 | **kill** | Native &mdash; `kill(2)` syscall with process group support |
-| **delete** | Native &mdash; kills cgroup processes, unmounts rootfs, cleans up state |
-| **exec** | Native &mdash; `setns(2)` into container namespaces, `fork`, `execvp` |
+| **delete** | Native &mdash; kills cgroup processes, removes cgroup, unmounts rootfs |
+| **exec** | Native &mdash; `setns(2)` into container namespaces, double-fork, `execvp` |
 | **pause/resume** | Native &mdash; cgroup v2 `cgroup.freeze` |
 | **stats/update** | Native &mdash; direct cgroup metrics and resource limits |
 | **ps** | Native &mdash; reads PIDs from `cgroup.procs` |
@@ -35,11 +35,14 @@ Container creation uses `fork(2)`, `unshare(2)`, `pivot_root(2)`, and `mount(2)`
 ```
 src/
 ├── runtime/
-│   ├── container.rs   — fork + namespace + pivot_root + mount + create/start/delete
-│   ├── exec.rs        — setns into container namespaces + fork/exec
-│   ├── rootfs.rs      — rootfs bind mount, pivot_root, OCI mounts, device nodes
-│   ├── namespace.rs   — unshare/setns helpers, OCI namespace mapping
-│   └── io.rs          — Io trait, FIFO and NullIo for container stdio
+│   ├── container.rs      — double-fork + namespace + pivot_root + mount + create/start/delete
+│   ├── exec.rs           — setns into container namespaces + fork/exec
+│   ├── rootfs.rs         — rootfs bind mount, pivot_root, OCI mounts, device nodes
+│   ├── namespace.rs      — unshare/setns helpers, OCI namespace mapping
+│   ├── cgroup.rs         — cgroup v2 create, resource limits, cleanup
+│   ├── capabilities.rs   — Linux capability dropping per OCI spec
+│   ├── network.rs        — loopback interface setup
+│   └── io.rs             — Io trait, FIFO and NullIo for container stdio
 ├── ironbox_container.rs — IronboxFactory, lifecycle trait impls
 ├── service.rs         — containerd shim v2 service
 ├── task.rs            — task service (container CRUD over TTRPC)
@@ -106,8 +109,9 @@ Some ways to contribute include:
 
 - **Phase 1**: Standalone containerd shim that delegates to runc.
 - **Phase 2**: Custom `IronboxFactory`/`IronboxContainer` types with native signal handling, cgroup management, and process listing.
-- **Phase 3** (current): Fully native OCI runtime &mdash; container create/start/delete/exec use Linux syscalls directly, no runc binary required.
-- **Phase 4**: Security hardening &mdash; seccomp filters, capability dropping, AppArmor/SELinux profiles.
+- **Phase 3**: Fully native OCI runtime &mdash; container create/start/delete/exec use Linux syscalls directly, no runc binary required.
+- **Phase 4** (current): Hardening &mdash; cgroup v2 resource limits, PID 1 via double-fork, capability dropping, loopback networking.
+- **Phase 5**: Seccomp filters, AppArmor/SELinux profiles, console/PTY support.
 
 ## Dependencies
 

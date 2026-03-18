@@ -99,9 +99,16 @@ impl Shim for Service {
             })
             .unwrap_or_else(|| bundle.join("rootfs"));
 
-        asyncify(move || delete_container(pid as i32, &rootfs, true))
+        // Resolve cgroup path for this container
+        let cgroup_path = std::path::PathBuf::from(format!(
+            "/sys/fs/cgroup/ironbox/{}",
+            self.id
+        ));
+
+        let id_clone = self.id.clone();
+        asyncify(move || delete_container(pid as i32, &rootfs, &cgroup_path, true))
             .await
-            .unwrap_or_else(|e| warn!("failed to clean up container: {}", e));
+            .unwrap_or_else(|e| warn!("failed to clean up container {}: {}", id_clone, e));
 
         let mut resp = DeleteResponse::new();
         // sigkill

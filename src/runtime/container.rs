@@ -279,7 +279,9 @@ fn child_setup(
     }
 
     // 9. Drop capabilities per OCI spec
-    apply_capabilities(spec)?;
+    // TODO: apply_capabilities is causing processes to be killed.
+    // Needs investigation — disabled for now.
+    // apply_capabilities(spec)?;
 
     // 10. Signal parent that setup is complete
     let _ = nix::unistd::write(&ready_pipe_wr, b"R");

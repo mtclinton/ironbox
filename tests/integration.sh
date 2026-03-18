@@ -6,7 +6,7 @@
 # Usage: sudo ./tests/integration.sh
 #
 
-set -euo pipefail
+set -uo pipefail
 
 RUNTIME="io.containerd.ironbox.v1"
 IMAGE="docker.io/library/alpine:latest"
@@ -20,10 +20,10 @@ NC='\033[0m'
 
 cleanup_container() {
     local name="$1"
-    sudo ctr task kill "$name" 2>/dev/null || true
-    sudo ctr task rm "$name" 2>/dev/null || true
-    sudo ctr container rm "$name" 2>/dev/null || true
-    sudo ctr snapshot rm "$name" 2>/dev/null || true
+    ctr task kill "$name" 2>/dev/null || true
+    ctr task rm "$name" 2>/dev/null || true
+    ctr container rm "$name" 2>/dev/null || true
+    ctr snapshot rm "$name" 2>/dev/null || true
 }
 
 # Run a short-lived container and check output contains expected string
@@ -31,23 +31,23 @@ run_test() {
     local name="$1"; shift
     local expected="$1"; shift
     local cname="test-${name}-$$"
-    ((TOTAL++))
+    TOTAL=$((TOTAL + 1))
     printf "  %-40s" "$name"
 
     cleanup_container "$cname" 2>/dev/null
 
     local output
-    if output=$(sudo ctr run --runtime "$RUNTIME" --rm "$IMAGE" "$cname" "$@" 2>&1); then
+    if output=$(ctr run --runtime "$RUNTIME" --rm "$IMAGE" "$cname" "$@" 2>&1); then
         if echo "$output" | grep -qE "$expected"; then
             echo -e "${GREEN}PASS${NC}"
-            ((PASS++))
+            PASS=$((PASS + 1))
         else
             echo -e "${RED}FAIL${NC} (expected /$expected/, got: $output)"
-            ((FAIL++))
+            FAIL=$((FAIL + 1))
         fi
     else
         echo -e "${RED}FAIL${NC} (exit error: $output)"
-        ((FAIL++))
+        FAIL=$((FAIL + 1))
     fi
 
     cleanup_container "$cname" 2>/dev/null
@@ -58,7 +58,7 @@ echo ""
 
 # Ensure image is available
 echo "Pulling image (if needed)..."
-sudo ctr image pull "$IMAGE" >/dev/null 2>&1 || true
+ctr image pull "$IMAGE" >/dev/null 2>&1 || true
 echo ""
 
 # --- Basic ---
@@ -105,49 +105,49 @@ run_test "cap-status"    "CapBnd"      sh -c "cat /proc/self/status | grep Cap"
 echo ""
 echo "Lifecycle:"
 LONG_NAME="test-long-$$"
-((TOTAL++))
+TOTAL=$((TOTAL + 1))
 printf "  %-40s" "long-running-kill"
 cleanup_container "$LONG_NAME" 2>/dev/null
-if sudo ctr run -d --runtime "$RUNTIME" "$IMAGE" "$LONG_NAME" sleep 300 2>&1; then
+if ctr run -d --runtime "$RUNTIME" "$IMAGE" "$LONG_NAME" sleep 300 2>&1; then
     # Verify it's running
-    if sudo ctr task ls 2>/dev/null | grep -q "$LONG_NAME"; then
-        sudo ctr task kill "$LONG_NAME" 2>/dev/null || true
+    if ctr task ls 2>/dev/null | grep -q "$LONG_NAME"; then
+        ctr task kill "$LONG_NAME" 2>/dev/null || true
         sleep 1
         cleanup_container "$LONG_NAME" 2>/dev/null
         echo -e "${GREEN}PASS${NC}"
-        ((PASS++))
+        PASS=$((PASS + 1))
     else
         echo -e "${RED}FAIL${NC} (not in task list)"
-        ((FAIL++))
+        FAIL=$((FAIL + 1))
         cleanup_container "$LONG_NAME" 2>/dev/null
     fi
 else
     echo -e "${RED}FAIL${NC} (couldn't start)"
-    ((FAIL++))
+    FAIL=$((FAIL + 1))
     cleanup_container "$LONG_NAME" 2>/dev/null
 fi
 
 # --- Exec ---
 EXEC_NAME="test-exec-$$"
-((TOTAL++))
+TOTAL=$((TOTAL + 1))
 printf "  %-40s" "exec"
 cleanup_container "$EXEC_NAME" 2>/dev/null
-if sudo ctr run -d --runtime "$RUNTIME" "$IMAGE" "$EXEC_NAME" sleep 300 2>&1; then
+if ctr run -d --runtime "$RUNTIME" "$IMAGE" "$EXEC_NAME" sleep 300 2>&1; then
     sleep 1
-    exec_out=$(sudo ctr task exec --exec-id e1 "$EXEC_NAME" echo "exec works" 2>&1) || true
+    exec_out=$(ctr task exec --exec-id e1 "$EXEC_NAME" echo "exec works" 2>&1) || true
     if echo "$exec_out" | grep -q "exec works"; then
         echo -e "${GREEN}PASS${NC}"
-        ((PASS++))
+        PASS=$((PASS + 1))
     else
         echo -e "${RED}FAIL${NC} ($exec_out)"
-        ((FAIL++))
+        FAIL=$((FAIL + 1))
     fi
-    sudo ctr task kill "$EXEC_NAME" 2>/dev/null || true
+    ctr task kill "$EXEC_NAME" 2>/dev/null || true
     sleep 1
     cleanup_container "$EXEC_NAME" 2>/dev/null
 else
     echo -e "${RED}FAIL${NC} (couldn't start)"
-    ((FAIL++))
+    FAIL=$((FAIL + 1))
     cleanup_container "$EXEC_NAME" 2>/dev/null
 fi
 

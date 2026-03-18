@@ -62,6 +62,7 @@ impl Io for NullIo {
 
 /// Uses named pipes (FIFOs) for container stdio.
 #[derive(Debug)]
+#[allow(clippy::upper_case_acronyms)]
 pub struct FIFO {
     pub stdin: Option<String>,
     pub stdout: Option<String>,

@@ -28,7 +28,7 @@ pub fn setup_loopback() -> Result<()> {
     // Set IFF_UP | IFF_RUNNING
     ifr.ifr_ifru.ifru_flags = (libc::IFF_UP | libc::IFF_RUNNING) as i16;
 
-    let ret = unsafe { libc::ioctl(sock, libc::SIOCSIFFLAGS as u64, &ifr) };
+    let ret = unsafe { libc::ioctl(sock, libc::SIOCSIFFLAGS, &ifr) };
     unsafe { libc::close(sock) };
 
     if ret != 0 {

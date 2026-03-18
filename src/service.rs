@@ -51,16 +51,13 @@ impl Shim for Service {
     async fn start_shim(&mut self, opts: StartOpts) -> containerd_shim::Result<String> {
         let mut grouping = opts.id.clone();
         let spec = read_spec("").await?;
-        match spec.annotations() {
-            Some(annotations) => {
-                for &label in GROUP_LABELS.iter() {
-                    if let Some(value) = annotations.get(label) {
-                        grouping = value.to_string();
-                        break;
-                    }
+        if let Some(annotations) = spec.annotations() {
+            for &label in GROUP_LABELS.iter() {
+                if let Some(value) = annotations.get(label) {
+                    grouping = value.to_string();
+                    break;
                 }
             }
-            None => {}
         }
         #[cfg(not(target_os = "linux"))]
         let thp_disabled = String::new();
@@ -162,11 +159,9 @@ async fn process_exits(
                         } else {
                             break;
                         }
-                    } else {
-                        if let Some((_, p)) = cont.processes.iter_mut().find(|(_, p)| p.pid == pid)
-                        {
-                            change_process.push(p as &mut (dyn Process + Send + Sync));
-                        }
+                    } else if let Some((_, p)) = cont.processes.iter_mut().find(|(_, p)| p.pid == pid)
+                    {
+                        change_process.push(p as &mut (dyn Process + Send + Sync));
                     }
                     let process_len = change_process.len();
                     for process in change_process {

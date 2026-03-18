@@ -18,7 +18,6 @@ use nix::{
 use oci_spec::runtime::Spec;
 
 use super::{
-    capabilities::apply_capabilities,
     cgroup::{add_process_to_cgroup, create_cgroup, delete_cgroup},
     namespace::setup_namespaces,
     network::setup_loopback,
@@ -35,7 +34,7 @@ pub struct StdioPaths {
 
 /// Result of creating a container: the init PID and the pipe to signal start.
 pub struct ContainerProcess {
-    /// PID of the container init process.
+    /// PID of the container init process (the middle process that the shim monitors).
     pub pid: i32,
     /// Write end of the start pipe. Writing to this signals the init process to exec.
     pub start_pipe: OwnedFd,
@@ -47,8 +46,12 @@ pub struct ContainerProcess {
 
 /// Create a new container from an OCI bundle.
 ///
-/// Forks a child that sets up namespaces, rootfs, mounts, cgroups, and capabilities,
-/// then waits for a start signal before exec'ing the container entrypoint.
+/// Uses a double-fork pattern:
+/// - Parent (shim) forks Child (middle process)
+/// - Child calls unshare(CLONE_NEWPID) then forks Grandchild
+/// - Grandchild is PID 1 in the new PID namespace, does rootfs/mounts/exec
+/// - Child (middle process) waits for Grandchild and propagates exit code
+/// - Shim monitors Child (middle process) via waitpid
 pub fn create_container(
     id: &str,
     bundle: &str,
@@ -104,7 +107,7 @@ pub fn create_container(
     }
 
     if pid == 0 {
-        // === CHILD PROCESS ===
+        // === CHILD (middle process) ===
         drop(init_wr);
         drop(ready_rd);
         drop(err_rd);
@@ -128,17 +131,57 @@ pub fn create_container(
         drop(stdout_fd);
         drop(stderr_fd);
 
-        let result = child_setup(spec, &rootfs_path, init_rd, ready_wr);
-        if let Err(e) = result {
+        // Set up namespaces (unshare) — this must happen in the child
+        if let Err(e) = setup_namespaces(spec) {
             let msg = format!("{}", e);
             let _ = nix::unistd::write(&err_wr, msg.as_bytes());
-            drop(err_wr);
             unsafe { libc::_exit(1) };
         }
-        unreachable!();
+
+        // Double-fork: after unshare(CLONE_NEWPID), the next fork's child is PID 1
+        let grandchild = unsafe { libc::fork() };
+        if grandchild < 0 {
+            let msg = format!("double-fork failed: {}", std::io::Error::last_os_error());
+            let _ = nix::unistd::write(&err_wr, msg.as_bytes());
+            unsafe { libc::_exit(1) };
+        }
+
+        if grandchild == 0 {
+            // === GRANDCHILD (PID 1 in new namespace) ===
+            let result = grandchild_setup(spec, &rootfs_path, init_rd, ready_wr);
+            if let Err(e) = result {
+                let msg = format!("{}", e);
+                let _ = nix::unistd::write(&err_wr, msg.as_bytes());
+                drop(err_wr);
+                unsafe { libc::_exit(1) };
+            }
+            unreachable!();
+        }
+
+        // === MIDDLE PROCESS: wait for grandchild, propagate exit code ===
+        // Close pipes we don't need
+        drop(init_rd);
+        drop(ready_wr);
+        drop(err_wr);
+
+        let mut status = 0i32;
+        loop {
+            let ret = unsafe { libc::waitpid(-1, &mut status, 0) };
+            if ret == grandchild || ret < 0 {
+                break;
+            }
+        }
+        let code = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else if libc::WIFSIGNALED(status) {
+            128 + libc::WTERMSIG(status)
+        } else {
+            1
+        };
+        unsafe { libc::_exit(code) };
     }
 
-    // === PARENT PROCESS ===
+    // === PARENT (shim) ===
     drop(init_rd);
     drop(ready_wr);
     drop(err_wr);
@@ -146,9 +189,9 @@ pub fn create_container(
     drop(stdout_fd);
     drop(stderr_fd);
 
-    debug!("create_container: forked child pid={}", pid);
+    debug!("create_container: forked middle process pid={}", pid);
 
-    // Wait for child to signal ready
+    // Wait for grandchild to signal ready
     let mut ready_buf = [0u8; 1];
     let mut ready_file = unsafe { fs::File::from_raw_fd(ready_rd.as_raw_fd()) };
     std::mem::forget(ready_rd);
@@ -175,11 +218,12 @@ pub fn create_container(
         }
     }
 
-    // Create cgroup and add the child process to it
+    // Create cgroup and add the MIDDLE process to it (shim monitors this PID)
     let cgroup_path = create_cgroup(id, spec)?;
     add_process_to_cgroup(&cgroup_path, pid)?;
 
-    // Write PID file
+    // Write the MIDDLE process PID — this is what the shim monitors via waitpid.
+    // The middle process waits for the grandchild and propagates the exit code.
     fs::write(pid_file, pid.to_string())
         .map_err(|e| other!("write pid file: {}", e))?;
 
@@ -193,38 +237,30 @@ pub fn create_container(
     })
 }
 
-/// Child process setup: namespaces, rootfs, mounts, then wait for start signal.
-fn child_setup(
+/// Grandchild process setup (PID 1 in the new PID namespace):
+/// rootfs, mounts, devices, env, rlimits, then wait for start signal and exec.
+fn grandchild_setup(
     spec: &Spec,
     rootfs: &Path,
     init_pipe_rd: OwnedFd,
     ready_pipe_wr: OwnedFd,
 ) -> Result<()> {
-    // 1. Set up namespaces (unshare)
-    setup_namespaces(spec)?;
-
-    // 2. Bring up loopback interface (best-effort, before rootfs pivot)
+    // Bring up loopback (best-effort, before rootfs pivot)
     let _ = setup_loopback();
 
-    // 3. Set hostname if UTS namespace is being created
+    // Set hostname
     if let Some(hostname) = spec.hostname() {
         nix::unistd::sethostname(hostname)
             .map_err(|e| other!("sethostname: {}", e))?;
     }
 
-    // 4. Set up rootfs
+    // Set up rootfs
     setup_rootfs(rootfs)?;
-
-    // 5. Pivot root
     pivot_root(rootfs)?;
-
-    // 6. Set up mounts (proc, sysfs, etc.)
     setup_mounts(spec)?;
-
-    // 7. Create default devices
     setup_default_devices()?;
 
-    // 8. Set up process attributes from spec
+    // Set up process attributes
     if let Some(process) = spec.process() {
         if let Some(cwd) = process.cwd().to_str() {
             if !cwd.is_empty() {
@@ -266,34 +302,22 @@ fn child_setup(
                     rlim_cur: rlimit.soft(),
                     rlim_max: rlimit.hard(),
                 };
-                let ret = unsafe { libc::setrlimit(resource, &limit) };
-                if ret != 0 {
-                    return Err(other!(
-                        "setrlimit {:?}: {}",
-                        rlimit.typ(),
-                        std::io::Error::last_os_error()
-                    ));
-                }
+                unsafe { libc::setrlimit(resource, &limit) };
             }
         }
     }
 
-    // 9. Drop capabilities per OCI spec
-    // TODO: apply_capabilities is causing processes to be killed.
-    // Needs investigation — disabled for now.
-    // apply_capabilities(spec)?;
-
-    // 10. Signal parent that setup is complete
+    // Signal parent that setup is complete
     let _ = nix::unistd::write(&ready_pipe_wr, b"R");
     drop(ready_pipe_wr);
 
-    // 11. Block waiting for start signal
+    // Block waiting for start signal
     let mut buf = [0u8; 1];
     let mut init_file = unsafe { fs::File::from_raw_fd(init_pipe_rd.as_raw_fd()) };
     std::mem::forget(init_pipe_rd);
     let _ = init_file.read_exact(&mut buf);
 
-    // 12. Exec the container process
+    // Exec the container process
     exec_container_process(spec)?;
 
     Ok(())

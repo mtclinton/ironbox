@@ -69,21 +69,25 @@ fn apply_resources(
     cgroup_path: &Path,
     resources: &oci_spec::runtime::LinuxResources,
 ) -> Result<()> {
-    // Memory limits
+    // Memory limits (0 or negative means "no limit" — skip)
     if let Some(memory) = resources.memory() {
         if let Some(limit) = memory.limit() {
-            write_cgroup_file(cgroup_path, "memory.max", &limit.to_string())?;
-            debug!("set memory.max = {}", limit);
+            if limit > 0 {
+                write_cgroup_file(cgroup_path, "memory.max", &limit.to_string())?;
+                debug!("set memory.max = {}", limit);
+            }
         }
         if let Some(reservation) = memory.reservation() {
-            write_cgroup_file(cgroup_path, "memory.low", &reservation.to_string())?;
+            if reservation > 0 {
+                write_cgroup_file(cgroup_path, "memory.low", &reservation.to_string())?;
+            }
         }
         if let Some(swap) = memory.swap() {
-            // cgroup v2: memory.swap.max is swap-only (not memory+swap like v1)
-            // OCI spec swap means memory+swap, so swap_max = swap - limit
             let mem_limit = memory.limit().unwrap_or(0);
-            let swap_only = if swap > mem_limit { swap - mem_limit } else { 0 };
-            write_cgroup_file(cgroup_path, "memory.swap.max", &swap_only.to_string())?;
+            if swap > 0 && swap > mem_limit {
+                let swap_only = swap - mem_limit;
+                write_cgroup_file(cgroup_path, "memory.swap.max", &swap_only.to_string())?;
+            }
         }
     }
 
@@ -93,16 +97,19 @@ fn apply_resources(
         let period = cpu.period().unwrap_or(100_000); // default 100ms
 
         if let Some(q) = quota {
-            let value = format!("{} {}", q, period);
-            write_cgroup_file(cgroup_path, "cpu.max", &value)?;
-            debug!("set cpu.max = {}", value);
+            if q > 0 {
+                let value = format!("{} {}", q, period);
+                write_cgroup_file(cgroup_path, "cpu.max", &value)?;
+                debug!("set cpu.max = {}", value);
+            }
         }
 
         if let Some(shares) = cpu.shares() {
-            // cgroup v2 uses cpu.weight (1-10000), v1 uses shares (2-262144)
-            // Convert: weight = (1 + ((shares - 2) * 9999) / 262142)
-            let weight = 1 + ((shares.saturating_sub(2) * 9999) / 262142);
-            write_cgroup_file(cgroup_path, "cpu.weight", &weight.to_string())?;
+            if shares > 0 {
+                // cgroup v2 uses cpu.weight (1-10000), v1 uses shares (2-262144)
+                let weight = 1 + ((shares.saturating_sub(2) * 9999) / 262142);
+                write_cgroup_file(cgroup_path, "cpu.weight", &weight.to_string())?;
+            }
         }
 
         // cpuset

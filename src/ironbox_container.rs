@@ -42,7 +42,7 @@ use crate::{
     io::Stdio,
     runtime::{
         container::{create_container, delete_container, start_container, StdioPaths},
-        exec::exec_in_container,
+        exec::{exec_in_container, ExecStdio},
     },
 };
 
@@ -400,8 +400,13 @@ impl ProcessLifecycle<ExecProcess> for IronboxExecLifecycle {
         // Native exec: fork, setns into container namespaces, exec
         let spec = self.spec.clone();
         let pid_path_clone = pid_path.clone();
+        let exec_stdio = ExecStdio {
+            stdin: p.stdio.stdin.clone(),
+            stdout: p.stdio.stdout.clone(),
+            stderr: p.stdio.stderr.clone(),
+        };
         let child_pid = asyncify(move || {
-            exec_in_container(container_pid, &spec, Some(&pid_path_clone))
+            exec_in_container(container_pid, &spec, Some(&pid_path_clone), Some(&exec_stdio))
         })
         .await?;
 

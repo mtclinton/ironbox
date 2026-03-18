@@ -62,6 +62,10 @@ pub fn create_container(
 ) -> Result<ContainerProcess> {
     let rootfs_path = resolve_rootfs(bundle, spec);
 
+    // Create cgroup BEFORE forking so the child can add itself before the double-fork.
+    // This ensures the grandchild (PID 1) inherits the cgroup.
+    let cgroup_path = create_cgroup(id, spec)?;
+
     // Open stdio FIFOs BEFORE forking so the child inherits the fds.
     let stdin_fd = if !stdio.stdin.is_empty() {
         Some(
@@ -138,6 +142,9 @@ pub fn create_container(
             let _ = nix::unistd::write(&err_wr, msg.as_bytes());
             unsafe { libc::_exit(1) };
         }
+
+        // Add self to cgroup BEFORE the double-fork so the grandchild inherits it
+        let _ = add_process_to_cgroup(&cgroup_path, std::process::id() as i32);
 
         // Double-fork: after unshare(CLONE_NEWPID), the next fork's child is PID 1
         let grandchild = unsafe { libc::fork() };
@@ -218,10 +225,6 @@ pub fn create_container(
             return Err(other!("container init failed: {}", err_msg));
         }
     }
-
-    // Create cgroup and add the MIDDLE process to it (shim monitors this PID)
-    let cgroup_path = create_cgroup(id, spec)?;
-    add_process_to_cgroup(&cgroup_path, pid)?;
 
     // Write the MIDDLE process PID — this is what the shim monitors via waitpid.
     // The middle process waits for the grandchild and propagates the exit code.

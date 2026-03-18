@@ -2,7 +2,10 @@ use std::{
     ffi::CString,
     fs,
     io::Read,
-    os::unix::io::{AsRawFd, FromRawFd, OwnedFd},
+    os::unix::{
+        fs::OpenOptionsExt,
+        io::{AsRawFd, FromRawFd, OwnedFd},
+    },
     path::Path,
 };
 
@@ -10,6 +13,13 @@ use containerd_shim::{other, Error, Result};
 use log::debug;
 use nix::sched::{setns, CloneFlags};
 use oci_spec::runtime::Process;
+
+/// Stdio paths for the exec'd process.
+pub struct ExecStdio {
+    pub stdin: String,
+    pub stdout: String,
+    pub stderr: String,
+}
 
 /// Exec a new process inside an existing container's namespaces.
 ///
@@ -19,6 +29,7 @@ pub fn exec_in_container(
     container_pid: i32,
     process: &Process,
     pid_file: Option<&Path>,
+    stdio: Option<&ExecStdio>,
 ) -> Result<i32> {
     // Collect namespace fds before forking
     let ns_types = [
@@ -29,7 +40,6 @@ pub fn exec_in_container(
         ("mnt", CloneFlags::CLONE_NEWNS),
     ];
 
-    // Open namespace fds
     let mut ns_fds: Vec<(std::fs::File, CloneFlags)> = Vec::new();
     for (name, flag) in &ns_types {
         let path = format!("/proc/{}/ns/{}", container_pid, name);
@@ -37,6 +47,30 @@ pub fn exec_in_container(
             ns_fds.push((f, *flag));
         }
     }
+
+    // Open stdio FIFOs before forking
+    let stdin_fd = stdio
+        .and_then(|s| {
+            if s.stdin.is_empty() { None } else {
+                fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&s.stdin)
+                    .ok()
+            }
+        });
+    let stdout_fd = stdio
+        .and_then(|s| {
+            if s.stdout.is_empty() { None } else {
+                fs::OpenOptions::new().write(true).open(&s.stdout).ok()
+            }
+        });
+    let stderr_fd = stdio
+        .and_then(|s| {
+            if s.stderr.is_empty() { None } else {
+                fs::OpenOptions::new().write(true).open(&s.stderr).ok()
+            }
+        });
 
     // Create sync pipes
     let (err_rd, err_wr) = pipe()?;
@@ -49,6 +83,25 @@ pub fn exec_in_container(
     if pid == 0 {
         // === CHILD PROCESS ===
         drop(err_rd);
+
+        // Redirect stdio
+        if let Some(ref f) = stdin_fd {
+            let raw = f.as_raw_fd();
+            unsafe {
+                let flags = libc::fcntl(raw, libc::F_GETFL);
+                libc::fcntl(raw, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+                libc::dup2(raw, 0);
+            }
+        }
+        if let Some(ref f) = stdout_fd {
+            unsafe { libc::dup2(f.as_raw_fd(), 1); }
+        }
+        if let Some(ref f) = stderr_fd {
+            unsafe { libc::dup2(f.as_raw_fd(), 2); }
+        }
+        drop(stdin_fd);
+        drop(stdout_fd);
+        drop(stderr_fd);
 
         let result = exec_child_setup(&ns_fds, process);
         if let Err(e) = result {
@@ -63,6 +116,9 @@ pub fn exec_in_container(
     // === PARENT PROCESS ===
     drop(err_wr);
     drop(ns_fds);
+    drop(stdin_fd);
+    drop(stdout_fd);
+    drop(stderr_fd);
 
     // Check for child setup errors
     let mut err_msg = String::new();
@@ -130,7 +186,6 @@ fn exec_child_setup(
     }
 
     // Set environment variables
-    // First clear inherited env
     for (key, _) in std::env::vars() {
         std::env::remove_var(&key);
     }
@@ -139,22 +194,6 @@ fn exec_child_setup(
             if let Some((key, value)) = var.split_once('=') {
                 std::env::set_var(key, value);
             }
-        }
-    }
-
-    // Set rlimits
-    if let Some(rlimits) = process.rlimits() {
-        for rlimit in rlimits {
-            let resource = match rlimit.typ() {
-                oci_spec::runtime::PosixRlimitType::RlimitNofile => libc::RLIMIT_NOFILE,
-                oci_spec::runtime::PosixRlimitType::RlimitNproc => libc::RLIMIT_NPROC,
-                _ => continue,
-            };
-            let limit = libc::rlimit {
-                rlim_cur: rlimit.soft(),
-                rlim_max: rlimit.hard(),
-            };
-            unsafe { libc::setrlimit(resource, &limit) };
         }
     }
 

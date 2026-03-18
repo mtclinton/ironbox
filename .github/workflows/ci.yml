@@ -12,8 +12,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone rust-extensions
-        run: git clone --depth 1 https://github.com/containerd/rust-extensions.git ../rust-extensions
+      - name: Clone rust-extensions (pinned to shim v0.8.0)
+        run: git clone https://github.com/containerd/rust-extensions.git ../rust-extensions && cd ../rust-extensions && git checkout 220d6d6
 
       - uses: dtolnay/rust-toolchain@stable
         with:

@@ -23,14 +23,13 @@ use std::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::io::RawFd,
     },
-    path::Path,
     sync::Arc,
     time::Duration,
 };
 
 use containerd_shim::{
-    api::{ExecProcessRequest, Options},
-    io_error, other, other_error,
+    api::ExecProcessRequest,
+    io_error, other,
     util::IntoOption,
     Error,
 };
@@ -43,12 +42,8 @@ use nix::{
     },
 };
 use oci_spec::runtime::{LinuxNamespaceType, Spec};
-use runc::{
-    io::{Io, NullIo, FIFO},
-    options::GlobalOpts,
-    Runc, Spawner,
-};
-use serde::Deserialize;
+
+use crate::runtime::io::{Io, NullIo, FIFO};
 
 use super::io::Stdio;
 
@@ -57,16 +52,9 @@ pub const GROUP_LABELS: [&str; 2] = [
     "io.kubernetes.cri.sandbox-id",
 ];
 pub const INIT_PID_FILE: &str = "init.pid";
-pub const LOG_JSON_FILE: &str = "log.json";
 pub const FIFO_SCHEME: &str = "fifo";
 
 const TIMEOUT_DURATION: std::time::Duration = Duration::from_secs(3);
-
-#[derive(Deserialize)]
-pub struct Log {
-    pub level: String,
-    pub msg: String,
-}
 
 #[derive(Default)]
 pub struct ProcessIO {
@@ -118,9 +106,6 @@ pub fn create_io(
     Ok(pio)
 }
 
-#[derive(Default, Debug)]
-pub struct ShimExecutor {}
-
 pub fn get_spec_from_request(
     req: &ExecProcessRequest,
 ) -> containerd_shim::Result<oci_spec::runtime::Process> {
@@ -146,47 +131,6 @@ pub fn check_kill_error(emsg: String) -> Error {
         other!("unknown error after kill {}", emsg)
     }
 }
-
-const DEFAULT_RUNC_ROOT: &str = "/run/containerd/runc";
-const DEFAULT_COMMAND: &str = "runc";
-
-pub fn create_runc(
-    runtime: &str,
-    namespace: &str,
-    bundle: impl AsRef<Path>,
-    opts: &Options,
-    spawner: Option<Arc<dyn Spawner + Send + Sync>>,
-) -> containerd_shim::Result<Runc> {
-    let runtime = if runtime.is_empty() {
-        DEFAULT_COMMAND
-    } else {
-        runtime
-    };
-    let root = opts.root.as_str();
-    let root = Path::new(if root.is_empty() {
-        DEFAULT_RUNC_ROOT
-    } else {
-        root
-    })
-    .join(namespace);
-
-    let log = bundle.as_ref().join(LOG_JSON_FILE);
-    let mut gopts = GlobalOpts::default()
-        .command(runtime)
-        .root(root)
-        .log(log)
-        .log_json()
-        .systemd_cgroup(opts.systemd_cgroup);
-    if let Some(s) = spawner {
-        gopts.custom_spawner(s);
-    }
-    gopts
-        .build()
-        .map_err(other_error!("unable to create runc instance"))
-}
-
-#[derive(Default)]
-pub(crate) struct CreateConfig {}
 
 pub fn receive_socket(stream_fd: RawFd) -> containerd_shim::Result<OwnedFd> {
     let mut buf = [0u8; 4096];

@@ -1,6 +1,5 @@
 use std::{env::current_dir, sync::Arc, time::Duration};
 
-use ::runc::options::DeleteOpts;
 use async_trait::async_trait;
 use containerd_shim::{
     asynchronous::{
@@ -13,7 +12,7 @@ use containerd_shim::{
     monitor::{Subject, Topic},
     protos::{events::task::TaskExit, protobuf::MessageDyn, ttrpc::context::with_duration},
     util::{
-        convert_to_timestamp, read_options, read_pid_from_file, read_runtime, read_spec, timestamp,
+        asyncify, convert_to_timestamp, read_pid_from_file, read_spec, timestamp,
         write_str_to_file,
     },
     Config, DeleteResponse, Error, Flags, StartOpts,
@@ -22,10 +21,11 @@ use log::{debug, error, warn};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 use crate::{
-    common::{create_runc, has_shared_pid_namespace, ShimExecutor, GROUP_LABELS, INIT_PID_FILE},
+    common::{has_shared_pid_namespace, GROUP_LABELS, INIT_PID_FILE},
     container::Container,
     ironbox_container::{IronboxContainer, IronboxFactory},
     processes::Process,
+    runtime::container::delete_container,
     task::TaskService,
 };
 
@@ -80,25 +80,29 @@ impl Shim for Service {
     }
 
     async fn delete_shim(&mut self) -> containerd_shim::Result<DeleteResponse> {
-        let namespace = self.namespace.as_str();
         let bundle = current_dir().map_err(io_error!(e, "get current dir"))?;
-        let opts = read_options(&bundle).await?;
-        let runtime = read_runtime(&bundle).await.unwrap_or_default();
-
-        let runc = create_runc(
-            &runtime,
-            namespace,
-            &bundle,
-            &opts,
-            Some(Arc::new(ShimExecutor::default())),
-        )?;
         let pid = read_pid_from_file(&bundle.join(INIT_PID_FILE))
             .await
             .unwrap_or_default();
 
-        runc.delete(&self.id, Some(&DeleteOpts { force: true }))
+        // Native delete: kill processes and clean up rootfs
+        let spec = read_spec(&bundle).await.ok();
+        let rootfs = spec
+            .as_ref()
+            .and_then(|s| s.root().as_ref().map(|r| r.path().clone()))
+            .map(|p| {
+                if p.is_absolute() {
+                    p
+                } else {
+                    bundle.join(p)
+                }
+            })
+            .unwrap_or_else(|| bundle.join("rootfs"));
+
+        asyncify(move || delete_container(pid as i32, &rootfs, true))
             .await
-            .unwrap_or_else(|e| warn!("failed to remove runc container: {}", e));
+            .unwrap_or_else(|e| warn!("failed to clean up container: {}", e));
+
         let mut resp = DeleteResponse::new();
         // sigkill
         resp.set_exit_status(137);

@@ -13,30 +13,44 @@
 ## What is ironbox?
 
 **ironbox** is a [containerd](https://containerd.io/) shim runtime built in Rust.
-It implements the containerd shim v2 API with its own `IronboxFactory` and `IronboxContainer` types that handle container lifecycle operations natively where possible, falling back to [runc](https://github.com/opencontainers/runc) for container creation.
+It implements the containerd shim v2 API with a native OCI runtime that manages container lifecycles using Linux syscalls directly &mdash; no dependency on the runc binary.
 
-The goal is to incrementally replace runc with a native Rust OCI runtime, learning the container stack from the shim layer down to namespaces, cgroups, and `pivot_root`.
+Container creation uses `fork(2)`, `unshare(2)`, `pivot_root(2)`, and `mount(2)` to set up isolated namespaces and a new root filesystem. Process exec joins existing namespaces via `setns(2)`. Signals, cgroup management, and process listing are all handled natively.
 
 ## Architecture
 
-ironbox uses custom container and process lifecycle types instead of wrapping the runc binary for every operation:
-
 | Operation | Implementation |
 |-----------|---------------|
-| **kill** | Native &mdash; sends signals directly via `kill(2)` syscall |
-| **pause/resume** | Native &mdash; writes to cgroup v2 `cgroup.freeze` |
-| **stats** | Native &mdash; reads cgroup metrics directly |
-| **update** | Native &mdash; writes cgroup resource limits directly |
+| **create** | Native &mdash; `fork`, `unshare` namespaces, `pivot_root`, OCI spec mounts, sync pipe for lifecycle |
+| **start** | Native &mdash; writes to sync pipe, init process execs the container entrypoint |
+| **kill** | Native &mdash; `kill(2)` syscall with process group support |
+| **delete** | Native &mdash; kills cgroup processes, unmounts rootfs, cleans up state |
+| **exec** | Native &mdash; `setns(2)` into container namespaces, `fork`, `execvp` |
+| **pause/resume** | Native &mdash; cgroup v2 `cgroup.freeze` |
+| **stats/update** | Native &mdash; direct cgroup metrics and resource limits |
 | **ps** | Native &mdash; reads PIDs from `cgroup.procs` |
-| **create** | Delegates to runc (namespace setup, `pivot_root`, mounts) |
-| **start** | Delegates to runc (signals init process) |
-| **exec** | Delegates to runc (`nsenter` into existing namespaces) |
-| **delete** | Delegates to runc (state + rootfs cleanup) |
+
+### Module structure
+
+```
+src/
+├── runtime/
+│   ├── container.rs   — fork + namespace + pivot_root + mount + create/start/delete
+│   ├── exec.rs        — setns into container namespaces + fork/exec
+│   ├── rootfs.rs      — rootfs bind mount, pivot_root, OCI mounts, device nodes
+│   ├── namespace.rs   — unshare/setns helpers, OCI namespace mapping
+│   └── io.rs          — Io trait, FIFO and NullIo for container stdio
+├── ironbox_container.rs — IronboxFactory, lifecycle trait impls
+├── service.rs         — containerd shim v2 service
+├── task.rs            — task service (container CRUD over TTRPC)
+├── container.rs       — generic container/process templates
+└── processes.rs       — process lifecycle traits
+```
 
 ## How do I use it?
 
 > [!NOTE]
-> ironbox requires a running [containerd](https://containerd.io/) daemon and [runc](https://github.com/opencontainers/runc) installed on the host.
+> ironbox requires a running [containerd](https://containerd.io/) daemon. No external OCI runtime (runc, crun, etc.) is needed.
 
 ### Build from source
 
@@ -84,22 +98,27 @@ All contributions are welcome!
 Some ways to contribute include:
 
 - Testing on different Linux distributions and reporting issues.
-- Implementing native replacements for the remaining runc-delegated operations.
+- Adding seccomp and AppArmor support.
 - Adding support for additional container features (checkpointing, lazy pulling, etc.).
 - Improving documentation and examples.
 
 ## Project roadmap
 
 - **Phase 1**: Standalone containerd shim that delegates to runc.
-- **Phase 2** (current): Custom `IronboxFactory`/`IronboxContainer` types with native signal handling, cgroup management, and process listing.
-- **Phase 3**: Build a minimal OCI runtime binary (`create`, `start`, `delete`, `state`) using namespaces, cgroups, and `pivot_root` directly, removing the runc dependency entirely.
+- **Phase 2**: Custom `IronboxFactory`/`IronboxContainer` types with native signal handling, cgroup management, and process listing.
+- **Phase 3** (current): Fully native OCI runtime &mdash; container create/start/delete/exec use Linux syscalls directly, no runc binary required.
+- **Phase 4**: Security hardening &mdash; seccomp filters, capability dropping, AppArmor/SELinux profiles.
 
 ## Dependencies
 
 ironbox builds on top of the [containerd rust-extensions](https://github.com/containerd/rust-extensions) project:
 
-- [`containerd-shim`](https://github.com/containerd/rust-extensions/tree/main/crates/shim) - Shim v2 API and TTRPC server
-- [`runc`](https://github.com/containerd/rust-extensions/tree/main/crates/runc) - Rust client for the runc binary (used for container creation)
+- [`containerd-shim`](https://github.com/containerd/rust-extensions/tree/main/crates/shim) &mdash; Shim v2 API and TTRPC server
+
+Core Linux interfaces are accessed via:
+
+- [`nix`](https://crates.io/crates/nix) &mdash; Rust bindings for `unshare`, `setns`, `mount`, `pivot_root`, `kill`, `sethostname`
+- [`oci-spec`](https://crates.io/crates/oci-spec) &mdash; OCI runtime specification parsing
 
 ## What does "ironbox" mean?
 

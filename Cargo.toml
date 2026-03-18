@@ -11,11 +11,10 @@ path = "src/main.rs"
 
 [dependencies]
 containerd-shim = { path = "../rust-extensions/crates/shim", version = "0.8.0", features = ["async"] }
-runc = { path = "../rust-extensions/crates/runc", version = "0.3.0", features = ["async"] }
 
 libc = "0.2"
 log = { version = "0.4", features = ["std", "kv_unstable"] }
-nix = { version = "0.29", features = ["socket", "uio", "term"] }
+nix = { version = "0.29", features = ["socket", "uio", "term", "sched", "mount", "signal", "hostname"] }
 oci-spec = "0.7"
 prctl = "1.0.0"
 serde = { version = "1.0", features = ["derive"] }
@@ -28,5 +27,5 @@ tokio = { version = "1", features = ["full"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 cgroups-rs = "0.3.4"
-nix = { version = "0.29", features = ["socket", "uio", "term", "event"] }
+nix = { version = "0.29", features = ["socket", "uio", "term", "event", "sched", "mount", "signal", "hostname"] }
 tokio-eventfd = "0.2.1"

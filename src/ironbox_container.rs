@@ -1,39 +1,34 @@
 use std::{
     os::{
         fd::{IntoRawFd, OwnedFd},
-        unix::{
-            io::{AsRawFd, FromRawFd},
-            prelude::ExitStatusExt,
-        },
+        unix::io::{AsRawFd, FromRawFd},
     },
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex as StdMutex},
 };
 
 use async_trait::async_trait;
 use containerd_shim::{
     api::{CreateTaskRequest, ExecProcessRequest, Options, Status},
-    asynchronous::monitor::{monitor_subscribe, monitor_unsubscribe, Subscription},
     io_error,
-    monitor::{ExitEvent, Subject, Topic},
     other,
     protos::{
         api::ProcessInfo,
         cgroups::metrics::Metrics,
         protobuf::{CodedInputStream, Message},
     },
-    util::{asyncify, mkdir, mount_rootfs, read_file_to_str, write_options, write_runtime},
+    util::{asyncify, mkdir, mount_rootfs, read_file_to_str, read_spec, write_options},
     Console, Error, ExitSignal, Result,
 };
-use log::{debug, error};
+use log::{debug, error, warn};
 use nix::{
     sys::signal::{kill, Signal},
     unistd::Pid,
 };
-use oci_spec::runtime::{LinuxResources, Process};
+use oci_spec::runtime::LinuxResources;
 use tokio::{
     fs::{remove_file, File, OpenOptions},
-    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, BufReader},
+    io::{AsyncRead, AsyncWrite},
 };
 
 use crate::{
@@ -41,10 +36,14 @@ use crate::{
     container::{ContainerFactory, ContainerTemplate, ProcessFactory},
     processes::{ProcessLifecycle, ProcessTemplate},
     common::{
-        check_kill_error, create_io, create_runc, get_spec_from_request, handle_file_open,
-        receive_socket, CreateConfig, Log, ProcessIO, ShimExecutor, INIT_PID_FILE, LOG_JSON_FILE,
+        check_kill_error, get_spec_from_request, handle_file_open,
+        receive_socket, ProcessIO, INIT_PID_FILE,
     },
     io::Stdio,
+    runtime::{
+        container::{create_container, delete_container, start_container},
+        exec::exec_in_container,
+    },
 };
 
 pub type ExecProcess = ProcessTemplate<IronboxExecLifecycle>;
@@ -59,7 +58,7 @@ pub(crate) struct IronboxFactory {}
 impl ContainerFactory<IronboxContainer> for IronboxFactory {
     async fn create(
         &self,
-        ns: &str,
+        _ns: &str,
         req: &CreateTaskRequest,
     ) -> containerd_shim::Result<IronboxContainer> {
         let bundle = req.bundle();
@@ -71,9 +70,7 @@ impl ContainerFactory<IronboxContainer> for IronboxFactory {
         if opts.compute_size() > 0 {
             debug!("create options: {:?}", &opts);
         }
-        let runtime = opts.binary_name.as_str();
         write_options(bundle, &opts).await?;
-        write_runtime(bundle, runtime).await?;
 
         let rootfs_vec = req.rootfs().to_vec();
         let rootfs = if !rootfs_vec.is_empty() {
@@ -88,33 +85,21 @@ impl ContainerFactory<IronboxContainer> for IronboxFactory {
             mount_rootfs(&m, rootfs.as_path()).await?
         }
 
-        // We still use runc for the heavy lifting of container creation (namespace setup,
-        // pivot_root, cgroup configuration, etc.) but handle lifecycle operations natively.
-        let runc = create_runc(
-            runtime,
-            ns,
-            bundle,
-            &opts,
-            Some(Arc::new(ShimExecutor::default())),
-        )?;
-
         let id = req.id();
         let stdio = Stdio::new(req.stdin(), req.stdout(), req.stderr(), req.terminal());
 
         let mut init = InitProcess::new(
             id,
             stdio,
-            IronboxInitLifecycle::new(runc.clone(), opts.clone(), bundle),
+            IronboxInitLifecycle::new(opts.clone(), bundle),
         );
 
-        let config = CreateConfig::default();
-        self.do_create(&mut init, config).await?;
+        self.do_create(&mut init).await?;
         let container = IronboxContainer {
             id: id.to_string(),
             bundle: bundle.to_string(),
             init,
             process_factory: IronboxExecFactory {
-                runtime: runc,
                 bundle: bundle.to_string(),
                 io_uid: opts.io_uid,
                 io_gid: opts.io_gid,
@@ -130,72 +115,34 @@ impl ContainerFactory<IronboxContainer> for IronboxFactory {
 }
 
 impl IronboxFactory {
-    async fn do_create(&self, init: &mut InitProcess, _config: CreateConfig) -> Result<()> {
+    async fn do_create(&self, init: &mut InitProcess) -> Result<()> {
         let id = init.id.to_string();
-        let stdio = &init.stdio;
-        let opts = &init.lifecycle.opts;
-        let bundle = &init.lifecycle.bundle;
-        let pid_path = Path::new(bundle).join(INIT_PID_FILE);
-        let mut create_opts = runc::options::CreateOpts::new()
-            .pid_file(&pid_path)
-            .no_pivot(opts.no_pivot_root)
-            .no_new_keyring(opts.no_new_keyring)
-            .detach(false);
-        let (socket, pio) = if stdio.terminal {
-            let s = ConsoleSocket::new().await?;
-            create_opts.console_socket = Some(s.path.to_owned());
-            (Some(s), None)
-        } else {
-            let pio = create_io(&id, opts.io_uid, opts.io_gid, stdio)?;
-            create_opts.io = pio.io.as_ref().cloned();
-            (None, Some(pio))
-        };
+        let bundle = init.lifecycle.bundle.clone();
+        let pid_path = Path::new(&bundle).join(INIT_PID_FILE);
 
-        let resp = init
-            .lifecycle
-            .runtime
-            .create(&id, bundle, Some(&create_opts))
-            .await;
-        if let Err(e) = resp {
-            if let Some(s) = socket {
-                s.clean().await;
-            }
-            return Err(runtime_error(bundle, e, "OCI runtime create failed").await);
+        // Read OCI spec
+        let spec = read_spec(&bundle).await?;
+
+        // Native container creation: fork, unshare, pivot_root, mounts
+        let container_process = asyncify(move || {
+            create_container(&id, &bundle, &spec, &pid_path)
+        })
+        .await?;
+
+        init.pid = container_process.pid;
+
+        // Store the start pipe and rootfs path in the lifecycle for later use
+        {
+            *init.lifecycle.start_pipe.lock().unwrap() = Some(container_process.start_pipe);
+            *init.lifecycle.rootfs.lock().unwrap() = Some(container_process.rootfs);
+            *init.lifecycle.container_pid.lock().unwrap() = container_process.pid;
         }
-        copy_io_or_console(init, socket, pio, init.lifecycle.exit_signal.clone()).await?;
-        let pid = read_file_to_str(pid_path).await?.parse::<i32>()?;
-        init.pid = pid;
+
         Ok(())
     }
 }
 
-pub async fn runtime_error(bundle: &str, e: runc::error::Error, msg: &str) -> Error {
-    let mut rt_msg = String::new();
-    match File::open(Path::new(bundle).join(LOG_JSON_FILE)).await {
-        Err(err) => other!("{}: unable to open OCI runtime log file){}", msg, err),
-        Ok(file) => {
-            let mut lines = BufReader::new(file).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                match serde_json::from_str::<Log>(&line) {
-                    Err(err) => return other!("{}: unable to parse log msg: {}", msg, err),
-                    Ok(log) => {
-                        if log.level == "error" {
-                            rt_msg = log.msg.trim().to_string();
-                        }
-                    }
-                }
-            }
-            if !rt_msg.is_empty() {
-                other!("{}: {}", msg, rt_msg)
-            } else {
-                other!("{}: (no OCI runtime error in logfile) {}", msg, e)
-            }
-        }
-    }
-}
-
 pub struct IronboxExecFactory {
-    runtime: runc::Runc,
     bundle: String,
     io_uid: u32,
     io_gid: u32,
@@ -220,33 +167,37 @@ impl ProcessFactory<ExecProcess> for IronboxExecFactory {
             wait_chan_tx: vec![],
             console: None,
             lifecycle: Arc::from(IronboxExecLifecycle {
-                runtime: self.runtime.clone(),
                 bundle: self.bundle.to_string(),
                 container_id: req.id.to_string(),
                 io_uid: self.io_uid,
                 io_gid: self.io_gid,
                 spec: p,
                 exit_signal: Default::default(),
+                container_pid: 0,
             }),
-            stdin: Arc::new(Mutex::new(None)),
+            stdin: Arc::new(StdMutex::new(None)),
         })
     }
 }
 
 pub struct IronboxInitLifecycle {
-    runtime: runc::Runc,
     opts: Options,
     bundle: String,
     exit_signal: Arc<ExitSignal>,
+    start_pipe: StdMutex<Option<OwnedFd>>,
+    rootfs: StdMutex<Option<PathBuf>>,
+    container_pid: StdMutex<i32>,
 }
 
 #[async_trait]
 impl ProcessLifecycle<InitProcess> for IronboxInitLifecycle {
     async fn start(&self, p: &mut InitProcess) -> containerd_shim::Result<()> {
-        // Native: use runc start to signal the container init process.
-        // In Phase 3 this would send SIGCONT directly to the init process.
-        if let Err(e) = self.runtime.start(p.id.as_str()).await {
-            return Err(runtime_error(&p.lifecycle.bundle, e, "OCI runtime start failed").await);
+        // Signal the container init process to exec via the start pipe
+        let pipe = self.start_pipe.lock().unwrap().take();
+        if let Some(pipe) = pipe {
+            start_container(&pipe)?;
+        } else {
+            return Err(other!("no start pipe available"));
         }
         p.state = Status::RUNNING;
         Ok(())
@@ -258,8 +209,6 @@ impl ProcessLifecycle<InitProcess> for IronboxInitLifecycle {
         signal: u32,
         all: bool,
     ) -> containerd_shim::Result<()> {
-        // Native kill: send signal directly via nix::sys::signal::kill
-        // instead of shelling out to `runc kill`.
         if p.pid <= 0 {
             return Err(Error::FailedPreconditionError(
                 "process not created".to_string(),
@@ -269,7 +218,6 @@ impl ProcessLifecycle<InitProcess> for IronboxInitLifecycle {
             .map_err(|e| Error::InvalidArgument(format!("invalid signal {}: {}", signal, e)))?;
 
         if all {
-            // Kill the entire process group by negating the pid
             kill(Pid::from_raw(-p.pid), sig).map_err(|e| check_kill_error(e.to_string()))?;
         } else {
             kill(Pid::from_raw(p.pid), sig).map_err(|e| check_kill_error(e.to_string()))?;
@@ -278,22 +226,11 @@ impl ProcessLifecycle<InitProcess> for IronboxInitLifecycle {
     }
 
     async fn delete(&self, p: &mut InitProcess) -> containerd_shim::Result<()> {
-        // Native delete: we still delegate to runc for cleanup of container state
-        // (rootfs unmount, cgroup cleanup, state directory removal).
-        // In Phase 3 this would be fully native.
-        if let Err(e) = self
-            .runtime
-            .delete(
-                p.id.as_str(),
-                Some(&runc::options::DeleteOpts { force: true }),
-            )
-            .await
-        {
-            if !e.to_string().to_lowercase().contains("does not exist") {
-                return Err(
-                    runtime_error(&p.lifecycle.bundle, e, "OCI runtime delete failed").await,
-                );
-            }
+        // Native delete: kill processes, unmount rootfs, clean up
+        let rootfs = self.rootfs.lock().unwrap().clone().unwrap_or_default();
+        let pid = p.pid;
+        if let Err(e) = asyncify(move || delete_container(pid, &rootfs, true)).await {
+            warn!("delete container cleanup: {}", e);
         }
         self.exit_signal.signal();
         Ok(())
@@ -313,7 +250,6 @@ impl ProcessLifecycle<InitProcess> for IronboxInitLifecycle {
                 p.pid
             ));
         }
-        // Native: update cgroups directly instead of via runc
         containerd_shim::cgroup::update_resources(p.pid as u32, resources)
     }
 
@@ -336,7 +272,6 @@ impl ProcessLifecycle<InitProcess> for IronboxInitLifecycle {
                 p.pid
             ));
         }
-        // Native: collect cgroup metrics directly
         containerd_shim::cgroup::collect_metrics(p.pid as u32)
     }
 
@@ -346,20 +281,16 @@ impl ProcessLifecycle<InitProcess> for IronboxInitLifecycle {
     }
 
     async fn ps(&self, p: &InitProcess) -> Result<Vec<ProcessInfo>> {
-        // Native: read /proc/<pid>/task to list threads, and walk cgroup procs
-        // For now, return just the init process pid
         let mut pids = Vec::new();
 
         #[cfg(target_os = "linux")]
         {
-            // Read PIDs from the cgroup procs file
             let cgroup_pids = read_cgroup_pids(p.pid).await;
             match cgroup_pids {
                 Ok(pid_list) => {
                     pids = pid_list;
                 }
                 Err(_) => {
-                    // Fallback: just report the init process
                     pids.push(p.pid as usize);
                 }
             }
@@ -384,7 +315,6 @@ impl ProcessLifecycle<InitProcess> for IronboxInitLifecycle {
         match p.state {
             Status::RUNNING => {
                 p.state = Status::PAUSING;
-                // Native: freeze via cgroup freezer instead of `runc pause`
                 if let Err(e) = freeze_cgroup(p.pid, true).await {
                     p.state = Status::RUNNING;
                     return Err(other!("failed to pause container: {}", e));
@@ -405,7 +335,6 @@ impl ProcessLifecycle<InitProcess> for IronboxInitLifecycle {
     async fn resume(&self, p: &mut InitProcess) -> Result<()> {
         match p.state {
             Status::PAUSED => {
-                // Native: thaw via cgroup freezer instead of `runc resume`
                 if let Err(e) = freeze_cgroup(p.pid, false).await {
                     return Err(other!("failed to resume container: {}", e));
                 }
@@ -423,29 +352,26 @@ impl ProcessLifecycle<InitProcess> for IronboxInitLifecycle {
 }
 
 impl IronboxInitLifecycle {
-    pub fn new(runtime: runc::Runc, opts: Options, bundle: &str) -> Self {
-        let work_dir = Path::new(bundle).join("work");
-        let mut opts = opts;
-        if opts.criu_path().is_empty() {
-            opts.criu_path = work_dir.to_string_lossy().to_string();
-        }
+    pub fn new(opts: Options, bundle: &str) -> Self {
         Self {
-            runtime,
             opts,
             bundle: bundle.to_string(),
             exit_signal: Default::default(),
+            start_pipe: StdMutex::new(None),
+            rootfs: StdMutex::new(None),
+            container_pid: StdMutex::new(0),
         }
     }
 }
 
 pub struct IronboxExecLifecycle {
-    runtime: runc::Runc,
     bundle: String,
     container_id: String,
     io_uid: u32,
     io_gid: u32,
-    spec: Process,
+    spec: oci_spec::runtime::Process,
     exit_signal: Arc<ExitSignal>,
+    container_pid: i32,
 }
 
 #[async_trait]
@@ -453,31 +379,21 @@ impl ProcessLifecycle<ExecProcess> for IronboxExecLifecycle {
     async fn start(&self, p: &mut ExecProcess) -> containerd_shim::Result<()> {
         let bundle = self.bundle.to_string();
         let pid_path = Path::new(&bundle).join(format!("{}.pid", &p.id));
-        let mut exec_opts = runc::options::ExecOpts {
-            io: None,
-            pid_file: Some(pid_path.to_owned()),
-            console_socket: None,
-            detach: true,
-        };
-        let (socket, pio) = if p.stdio.terminal {
-            let s = ConsoleSocket::new().await?;
-            exec_opts.console_socket = Some(s.path.to_owned());
-            (Some(s), None)
-        } else {
-            let pio = create_io(&p.id, self.io_uid, self.io_gid, &p.stdio)?;
-            exec_opts.io = pio.io.as_ref().cloned();
-            (None, Some(pio))
-        };
-        let exec_result = self
-            .runtime
-            .exec(&self.container_id, &self.spec, Some(&exec_opts))
-            .await;
-        if let Err(e) = exec_result {
-            if let Some(s) = socket {
-                s.clean().await;
-            }
-            return Err(runtime_error(&bundle, e, "OCI runtime exec failed").await);
-        }
+
+        // Find the container init PID to enter its namespaces
+        let init_pid_path = Path::new(&bundle).join(INIT_PID_FILE);
+        let container_pid = read_file_to_str(&init_pid_path)
+            .await?
+            .parse::<i32>()
+            .map_err(|e| other!("parse init pid: {}", e))?;
+
+        // Native exec: fork, setns into container namespaces, exec
+        let spec = self.spec.clone();
+        let pid_path_clone = pid_path.clone();
+        let child_pid = asyncify(move || {
+            exec_in_container(container_pid, &spec, Some(&pid_path_clone))
+        })
+        .await?;
 
         if !p.stdio.stdin.is_empty() {
             let stdin_clone = p.stdio.stdin.clone();
@@ -494,9 +410,7 @@ impl ProcessLifecycle<ExecProcess> for IronboxExecLifecycle {
             });
         }
 
-        copy_io_or_console(p, socket, pio, p.lifecycle.exit_signal.clone()).await?;
-        let pid = read_file_to_str(pid_path).await?.parse::<i32>()?;
-        p.pid = pid;
+        p.pid = child_pid;
         p.state = Status::RUNNING;
         Ok(())
     }
@@ -507,7 +421,6 @@ impl ProcessLifecycle<ExecProcess> for IronboxExecLifecycle {
         signal: u32,
         _all: bool,
     ) -> containerd_shim::Result<()> {
-        // Native kill: send signal directly instead of shelling out
         if p.pid <= 0 {
             Err(Error::FailedPreconditionError(
                 "process not created".to_string(),
@@ -551,7 +464,6 @@ impl ProcessLifecycle<ExecProcess> for IronboxExecLifecycle {
 
 // --- Native Linux helpers ---
 
-/// Check if a process is a zombie
 #[cfg(target_os = "linux")]
 fn is_zombie_process(pid: i32) -> bool {
     if let Ok(status) = std::fs::read_to_string(format!("/proc/{}/status", pid)) {
@@ -564,17 +476,13 @@ fn is_zombie_process(pid: i32) -> bool {
     false
 }
 
-/// Read PIDs from the container's cgroup
 #[cfg(target_os = "linux")]
 async fn read_cgroup_pids(pid: i32) -> Result<Vec<usize>> {
-    // Find the cgroup path for this process
     let cgroup_path = format!("/proc/{}/cgroup", pid);
     let content = tokio::fs::read_to_string(&cgroup_path)
         .await
         .map_err(io_error!(e, "read cgroup for pid {}", pid))?;
 
-    // For cgroup v2, the line is "0::/path"
-    // For cgroup v1, look for the first entry
     let cgroup_rel = content
         .lines()
         .find_map(|line| {
@@ -587,12 +495,10 @@ async fn read_cgroup_pids(pid: i32) -> Result<Vec<usize>> {
         })
         .ok_or_else(|| other!("failed to parse cgroup path for pid {}", pid))?;
 
-    // Try cgroup v2 first
     let procs_path = format!("/sys/fs/cgroup{}/cgroup.procs", cgroup_rel);
     let procs_content = match tokio::fs::read_to_string(&procs_path).await {
         Ok(c) => c,
         Err(_) => {
-            // Fallback: just return the init pid
             return Ok(vec![pid as usize]);
         }
     };
@@ -609,7 +515,6 @@ async fn read_cgroup_pids(pid: i32) -> Result<Vec<usize>> {
     }
 }
 
-/// Freeze or thaw a container via its cgroup freezer
 #[cfg(target_os = "linux")]
 async fn freeze_cgroup(pid: i32, freeze: bool) -> Result<()> {
     let cgroup_path = format!("/proc/{}/cgroup", pid);
@@ -629,7 +534,6 @@ async fn freeze_cgroup(pid: i32, freeze: bool) -> Result<()> {
         })
         .ok_or_else(|| other!("failed to parse cgroup path for pid {}", pid))?;
 
-    // cgroup v2: write to cgroup.freeze
     let freeze_path = format!("/sys/fs/cgroup{}/cgroup.freeze", cgroup_rel);
     let value = if freeze { "1" } else { "0" };
 
@@ -640,7 +544,7 @@ async fn freeze_cgroup(pid: i32, freeze: bool) -> Result<()> {
     Ok(())
 }
 
-// --- IO helpers (same as runc.rs but using our types) ---
+// --- IO helpers ---
 
 async fn copy_console(
     console_socket: &ConsoleSocket,
@@ -831,67 +735,4 @@ async fn copy_io_or_console<P>(
         copy_io(&pio, &p.stdio, exit_signal).await?;
     }
     Ok(())
-}
-
-// ShimExecutor Spawner impl for the runc crate - reused from common.rs
-use std::process::ExitStatus;
-use runc::{Command, Spawner};
-
-#[async_trait]
-impl Spawner for ShimExecutor {
-    async fn execute(&self, cmd: Command) -> runc::Result<(ExitStatus, u32, String, String)> {
-        let mut cmd = cmd;
-        let subscription = monitor_subscribe(Topic::Pid)
-            .await
-            .map_err(|e| runc::error::Error::Other(Box::new(e)))?;
-        let sid = subscription.id;
-        let child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                monitor_unsubscribe(sid).await.unwrap_or_default();
-                return Err(runc::error::Error::ProcessSpawnFailed(e));
-            }
-        };
-        let pid = child.id().unwrap();
-        let (stdout, stderr, exit_code) = tokio::join!(
-            read_std(child.stdout),
-            read_std(child.stderr),
-            wait_pid(pid as i32, subscription)
-        );
-        let status = ExitStatus::from_raw(exit_code);
-        monitor_unsubscribe(sid).await.unwrap_or_default();
-        Ok((status, pid, stdout, stderr))
-    }
-}
-
-async fn read_std<T>(std: Option<T>) -> String
-where
-    T: AsyncRead + Unpin,
-{
-    let mut std = std;
-    if let Some(mut std) = std.take() {
-        let mut out = String::new();
-        std.read_to_string(&mut out).await.unwrap_or_else(|e| {
-            error!("failed to read stdout {}", e);
-            0
-        });
-        return out;
-    }
-    "".to_string()
-}
-
-async fn wait_pid(pid: i32, s: Subscription) -> i32 {
-    let mut s = s;
-    loop {
-        if let Some(ExitEvent {
-            subject: Subject::Pid(epid),
-            exit_code: code,
-        }) = s.rx.recv().await
-        {
-            if pid == epid {
-                monitor_unsubscribe(s.id).await.unwrap_or_default();
-                return code;
-            }
-        }
-    }
 }

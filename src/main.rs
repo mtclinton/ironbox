@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use containerd_shim::asynchronous::run;
 
 mod cgroup_memory;
@@ -6,6 +8,7 @@ mod console;
 mod container;
 mod io;
 mod processes;
+mod runtime;
 mod ironbox_container;
 mod service;
 mod task;

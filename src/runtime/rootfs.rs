@@ -7,10 +7,21 @@ use containerd_shim::{other, Error, Result};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use oci_spec::runtime::{Mount as OciMount, Spec};
 
-/// Set up the container rootfs: bind-mount it, then pivot_root into it.
+/// Set up the container rootfs: make mounts private, bind-mount rootfs.
 pub fn setup_rootfs(rootfs: &Path) -> Result<()> {
-    // Bind mount rootfs onto itself so pivot_root works
-    // (pivot_root requires new_root to be a mount point)
+    // 1. Make the entire mount tree private/slave so mount events
+    //    don't propagate back to the host. This is required before pivot_root.
+    mount(
+        None::<&str>,
+        "/",
+        None::<&str>,
+        MsFlags::MS_SLAVE | MsFlags::MS_REC,
+        None::<&str>,
+    )
+    .map_err(|e| other!("make mount tree slave: {}", e))?;
+
+    // 2. Bind mount rootfs onto itself so it becomes a mount point
+    //    (pivot_root requires new_root to be a mount point)
     mount(
         Some(rootfs),
         rootfs,
@@ -25,14 +36,20 @@ pub fn setup_rootfs(rootfs: &Path) -> Result<()> {
 
 /// Perform pivot_root: switch the root filesystem to the container's rootfs.
 pub fn pivot_root(rootfs: &Path) -> Result<()> {
-    let old_root = rootfs.join("oldrootfs");
-    fs::create_dir_all(&old_root)
+    // chdir into the new rootfs first — pivot_root(".", "oldrootfs") is the
+    // most portable invocation and avoids issues with path resolution.
+    std::env::set_current_dir(rootfs)
+        .map_err(|e| other!("chdir to rootfs: {}", e))?;
+
+    let old_root_name = "oldrootfs";
+    fs::create_dir_all(old_root_name)
         .map_err(|e| other!("mkdir oldrootfs: {}", e))?;
 
-    nix::unistd::pivot_root(rootfs, &old_root)
+    // pivot_root(".", "oldrootfs") — "." is the new root, "oldrootfs" receives the old root
+    nix::unistd::pivot_root(".", old_root_name)
         .map_err(|e| other!("pivot_root: {}", e))?;
 
-    // Change to new root
+    // Now inside the new root. chdir to "/" to drop any reference to the old tree.
     std::env::set_current_dir("/")
         .map_err(|e| other!("chdir /: {}", e))?;
 

@@ -2,7 +2,10 @@ use std::{
     ffi::CString,
     fs,
     io::Read,
-    os::unix::io::{AsRawFd, FromRawFd, OwnedFd},
+    os::unix::{
+        fs::OpenOptionsExt,
+        io::{AsRawFd, FromRawFd, OwnedFd},
+    },
     path::{Path, PathBuf},
 };
 
@@ -19,6 +22,14 @@ use super::{
     rootfs::{cleanup_rootfs, pivot_root, setup_default_devices, setup_mounts, setup_rootfs},
 };
 
+/// Stdio paths (named FIFOs) for the container process.
+pub struct StdioPaths {
+    pub stdin: String,
+    pub stdout: String,
+    pub stderr: String,
+    pub terminal: bool,
+}
+
 /// Result of creating a container: the init PID and the pipe to signal start.
 pub struct ContainerProcess {
     /// PID of the container init process.
@@ -32,12 +43,13 @@ pub struct ContainerProcess {
 /// Create a new container from an OCI bundle.
 ///
 /// This forks a child process that:
-/// 1. Unshares namespaces per the OCI spec
-/// 2. Sets up rootfs (bind mount + pivot_root)
-/// 3. Sets up mounts from the OCI spec
-/// 4. Signals "ready" to the parent
-/// 5. Blocks waiting for the "start" signal
-/// 6. Execs the process from the OCI spec
+/// 1. Redirects stdio to containerd's FIFOs
+/// 2. Unshares namespaces per the OCI spec
+/// 3. Sets up rootfs (bind mount + pivot_root)
+/// 4. Sets up mounts from the OCI spec
+/// 5. Signals "ready" to the parent
+/// 6. Blocks waiting for the "start" signal
+/// 7. Execs the process from the OCI spec
 ///
 /// Returns a ContainerProcess with the child PID and start pipe.
 pub fn create_container(
@@ -45,8 +57,44 @@ pub fn create_container(
     bundle: &str,
     spec: &Spec,
     pid_file: &Path,
+    stdio: &StdioPaths,
 ) -> Result<ContainerProcess> {
     let rootfs_path = resolve_rootfs(bundle, spec);
+
+    // Open stdio FIFOs BEFORE forking so the child inherits the fds.
+    // The child will dup2 these onto fd 0/1/2.
+    let stdin_fd = if !stdio.stdin.is_empty() {
+        Some(
+            fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&stdio.stdin)
+                .map_err(|e| other!("open stdin fifo {}: {}", &stdio.stdin, e))?,
+        )
+    } else {
+        None
+    };
+
+    let stdout_fd = if !stdio.stdout.is_empty() {
+        Some(
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&stdio.stdout)
+                .map_err(|e| other!("open stdout fifo {}: {}", &stdio.stdout, e))?,
+        )
+    } else {
+        None
+    };
+    let stderr_fd = if !stdio.stderr.is_empty() {
+        Some(
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&stdio.stderr)
+                .map_err(|e| other!("open stderr fifo {}: {}", &stdio.stderr, e))?,
+        )
+    } else {
+        None
+    };
 
     // Create sync pipes
     // init_pipe: parent writes → child reads (start signal)
@@ -70,6 +118,27 @@ pub fn create_container(
         drop(ready_rd);
         drop(err_rd);
 
+        // Redirect stdio to the containerd FIFOs
+        if let Some(ref f) = stdin_fd {
+            // Clear O_NONBLOCK for stdin
+            let raw = f.as_raw_fd();
+            unsafe {
+                let flags = libc::fcntl(raw, libc::F_GETFL);
+                libc::fcntl(raw, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+                libc::dup2(raw, 0);
+            }
+        }
+        if let Some(ref f) = stdout_fd {
+            unsafe { libc::dup2(f.as_raw_fd(), 1); }
+        }
+        if let Some(ref f) = stderr_fd {
+            unsafe { libc::dup2(f.as_raw_fd(), 2); }
+        }
+        // Close the original fds (now duped onto 0/1/2)
+        drop(stdin_fd);
+        drop(stdout_fd);
+        drop(stderr_fd);
+
         // Run child setup; if anything fails, write error to err_pipe and exit
         let result = child_setup(spec, &rootfs_path, init_rd, ready_wr);
         if let Err(e) = result {
@@ -83,10 +152,13 @@ pub fn create_container(
     }
 
     // === PARENT PROCESS ===
-    // Close child-side pipe ends
+    // Close child-side pipe ends and stdio fds
     drop(init_rd);
     drop(ready_wr);
     drop(err_wr);
+    drop(stdin_fd);
+    drop(stdout_fd);
+    drop(stderr_fd);
 
     debug!("create_container: forked child pid={}", pid);
 
@@ -152,20 +224,16 @@ fn child_setup(
     // 3. Set up rootfs
     setup_rootfs(rootfs)?;
 
-    // 4. Set up mounts from spec (before pivot_root for bind mounts that reference host paths)
-    // For mounts that reference the new rootfs, we need to handle them after pivot_root.
-    // Standard approach: do bind mounts before pivot, do virtual fs mounts after.
-
-    // 5. Pivot root
+    // 4. Pivot root
     pivot_root(rootfs)?;
 
-    // 6. Set up remaining mounts (proc, sysfs, etc.) — these are inside the new root
+    // 5. Set up remaining mounts (proc, sysfs, etc.) — these are inside the new root
     setup_mounts(spec)?;
 
-    // 7. Create default devices
+    // 6. Create default devices
     setup_default_devices()?;
 
-    // 8. Set up process attributes from spec
+    // 7. Set up process attributes from spec
     if let Some(process) = spec.process() {
         // Set working directory
         if let Some(cwd) = process.cwd().to_str() {
@@ -222,17 +290,17 @@ fn child_setup(
         }
     }
 
-    // 9. Signal parent that setup is complete
+    // 8. Signal parent that setup is complete
     let _ = nix::unistd::write(&ready_pipe_wr, b"R");
     drop(ready_pipe_wr);
 
-    // 10. Block waiting for start signal
+    // 9. Block waiting for start signal
     let mut buf = [0u8; 1];
     let mut init_file = unsafe { fs::File::from_raw_fd(init_pipe_rd.as_raw_fd()) };
     std::mem::forget(init_pipe_rd);
     let _ = init_file.read_exact(&mut buf);
 
-    // 11. Exec the container process
+    // 10. Exec the container process
     exec_container_process(spec)?;
 
     // Should not reach here
@@ -344,3 +412,4 @@ fn pipe() -> Result<(OwnedFd, OwnedFd)> {
         )
     })
 }
+

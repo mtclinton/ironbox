@@ -41,7 +41,7 @@ use crate::{
     },
     io::Stdio,
     runtime::{
-        container::{create_container, delete_container, start_container},
+        container::{create_container, delete_container, start_container, StdioPaths},
         exec::exec_in_container,
     },
 };
@@ -119,13 +119,19 @@ impl IronboxFactory {
         let id = init.id.to_string();
         let bundle = init.lifecycle.bundle.clone();
         let pid_path = Path::new(&bundle).join(INIT_PID_FILE);
+        let stdio_paths = StdioPaths {
+            stdin: init.stdio.stdin.clone(),
+            stdout: init.stdio.stdout.clone(),
+            stderr: init.stdio.stderr.clone(),
+            terminal: init.stdio.terminal,
+        };
 
         // Read OCI spec
         let spec = read_spec(&bundle).await?;
 
         // Native container creation: fork, unshare, pivot_root, mounts
         let container_process = asyncify(move || {
-            create_container(&id, &bundle, &spec, &pid_path)
+            create_container(&id, &bundle, &spec, &pid_path, &stdio_paths)
         })
         .await?;
 

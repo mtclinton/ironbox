@@ -18,6 +18,7 @@ use nix::{
 use oci_spec::runtime::Spec;
 
 use super::{
+    capabilities::apply_capabilities,
     cgroup::{add_process_to_cgroup, create_cgroup, delete_cgroup},
     namespace::setup_namespaces,
     network::setup_loopback,
@@ -306,6 +307,9 @@ fn grandchild_setup(
             }
         }
     }
+
+    // Drop capabilities per OCI spec
+    apply_capabilities(spec)?;
 
     // Signal parent that setup is complete
     let _ = nix::unistd::write(&ready_pipe_wr, b"R");

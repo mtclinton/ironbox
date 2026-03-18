@@ -55,17 +55,17 @@ src/
 > [!NOTE]
 > ironbox requires a running [containerd](https://containerd.io/) daemon. No external OCI runtime (runc, crun, etc.) is needed.
 
-### Build from source
+### Build and install
+
+```shell
+make build
+sudo make install
+```
+
+Or manually:
 
 ```shell
 cargo build --release
-```
-
-### Install
-
-Copy the shim binary to a location in containerd's `PATH`:
-
-```shell
 sudo cp target/release/containerd-shim-ironbox-v1 /usr/local/bin/
 ```
 
@@ -94,6 +94,24 @@ metadata:
 handler: ironbox
 ```
 
+## Testing
+
+Run the integration test suite (requires root and a running containerd):
+
+```shell
+sudo make test
+```
+
+This runs ~15 tests covering basic execution, PID namespace, cgroups, filesystem isolation, networking, capabilities, long-running containers, and exec.
+
+## Known limitations
+
+- **Console/PTY** &mdash; `ctr run -t` (interactive terminal mode) is not yet supported. Non-terminal stdio works.
+- **Seccomp** &mdash; No seccomp filter support. Containers run without syscall filtering.
+- **AppArmor/SELinux** &mdash; No mandatory access control profile support.
+- **User namespaces** &mdash; Rootless containers are not supported.
+- **Networking** &mdash; Only loopback is configured. Bridge/veth networking depends on CNI plugins (external to the runtime).
+
 ## How do I contribute?
 
 All contributions are welcome!
@@ -102,7 +120,7 @@ Some ways to contribute include:
 
 - Testing on different Linux distributions and reporting issues.
 - Adding seccomp and AppArmor support.
-- Adding support for additional container features (checkpointing, lazy pulling, etc.).
+- Adding console/PTY support for interactive containers.
 - Improving documentation and examples.
 
 ## Project roadmap
@@ -110,8 +128,9 @@ Some ways to contribute include:
 - **Phase 1**: Standalone containerd shim that delegates to runc.
 - **Phase 2**: Custom `IronboxFactory`/`IronboxContainer` types with native signal handling, cgroup management, and process listing.
 - **Phase 3**: Fully native OCI runtime &mdash; container create/start/delete/exec use Linux syscalls directly, no runc binary required.
-- **Phase 4** (current): Hardening &mdash; cgroup v2 resource limits, PID 1 via double-fork, capability dropping, loopback networking.
-- **Phase 5**: Seccomp filters, AppArmor/SELinux profiles, console/PTY support.
+- **Phase 4**: Hardening &mdash; cgroup v2 resource limits, PID 1 via double-fork, capability dropping, loopback networking.
+- **Phase 5** (current): Integration tests, CI, exec support, release.
+- **Phase 6**: Seccomp filters, AppArmor/SELinux profiles, console/PTY support.
 
 ## Dependencies
 

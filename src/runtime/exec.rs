@@ -50,7 +50,7 @@ pub fn exec_in_container(
         // === CHILD PROCESS ===
         drop(err_rd);
 
-        let result = exec_child_setup(&ns_fds, container_pid, process);
+        let result = exec_child_setup(&ns_fds, process);
         if let Err(e) = result {
             let msg = format!("{}", e);
             let _ = nix::unistd::write(&err_wr, msg.as_bytes());
@@ -88,7 +88,6 @@ pub fn exec_in_container(
 /// Child process for exec: join namespaces and exec.
 fn exec_child_setup(
     ns_fds: &[(std::fs::File, CloneFlags)],
-    container_pid: i32,
     process: &Process,
 ) -> Result<()> {
     // Join each namespace
@@ -116,12 +115,12 @@ fn exec_child_setup(
 
     // === INNER CHILD (now in the container's PID namespace) ===
 
-    // Change to the container's root
-    let root_path = format!("/proc/{}/root", container_pid);
-    nix::unistd::chroot(root_path.as_str())
-        .map_err(|e| other!("chroot to container root: {}", e))?;
+    // After setns(MNT), we're in the container's mount namespace.
+    // The container's rootfs is at / — just chdir there.
+    std::env::set_current_dir("/")
+        .map_err(|e| other!("chdir /: {}", e))?;
 
-    // Set working directory
+    // Set working directory from process spec
     let cwd = process.cwd();
     if let Some(cwd_str) = cwd.to_str() {
         if !cwd_str.is_empty() {

@@ -90,32 +90,11 @@ pub fn apply_capabilities(spec: &Spec) -> Result<()> {
         }
     }
 
-    // 2. Set effective/permitted/inheritable via capset(2) (only if any are specified)
-    let has_cap_sets = capabilities.effective().is_some()
-        || capabilities.permitted().is_some()
-        || capabilities.inheritable().is_some();
-
-    if has_cap_sets {
-        // If a set is not specified, default to all caps (don't restrict)
-        let all_caps: u64 = (1u64 << (CAP_LAST_CAP + 1)) - 1;
-        let effective = capabilities
-            .effective()
-            .as_ref()
-            .map(|v| caps_to_mask(v))
-            .unwrap_or(all_caps);
-        let permitted = capabilities
-            .permitted()
-            .as_ref()
-            .map(|v| caps_to_mask(v))
-            .unwrap_or(all_caps);
-        let inheritable = capabilities
-            .inheritable()
-            .as_ref()
-            .map(|v| caps_to_mask(v))
-            .unwrap_or(0); // inheritable defaults to empty
-
-        set_caps(effective, permitted, inheritable)?;
-    }
+    // 2. Note: we intentionally do NOT call capset() here.
+    // The bounding set drop above is sufficient — after execvp, the kernel
+    // computes the new effective/permitted sets from the bounding set.
+    // Calling capset() before exec can restrict capabilities too aggressively,
+    // preventing the exec'd process from functioning.
 
     // 3. Set ambient capabilities
     if let Some(ambient) = capabilities.ambient() {

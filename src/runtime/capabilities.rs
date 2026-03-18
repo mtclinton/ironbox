@@ -73,43 +73,49 @@ pub fn apply_capabilities(spec: &Spec) -> Result<()> {
         None => return Ok(()),
     };
 
-    // 1. Drop capabilities not in the bounding set
-    let bounding = capabilities
-        .bounding()
-        .as_ref()
-        .map(|v| caps_to_mask(v))
-        .unwrap_or(0);
+    // 1. Drop capabilities not in the bounding set (only if bounding is specified)
+    if let Some(bounding_set) = capabilities.bounding() {
+        let bounding = caps_to_mask(bounding_set);
 
-    for cap in 0..=CAP_LAST_CAP {
-        if bounding & (1u64 << cap) == 0 {
-            let ret = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap as u64, 0, 0, 0) };
-            if ret != 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::EINVAL) {
-                    return Err(other!("PR_CAPBSET_DROP cap {}: {}", cap, err));
+        for cap in 0..=CAP_LAST_CAP {
+            if bounding & (1u64 << cap) == 0 {
+                let ret = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap as u64, 0, 0, 0) };
+                if ret != 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() != Some(libc::EINVAL) {
+                        return Err(other!("PR_CAPBSET_DROP cap {}: {}", cap, err));
+                    }
                 }
             }
         }
     }
 
-    // 2. Set effective/permitted/inheritable via capset(2)
-    let effective = capabilities
-        .effective()
-        .as_ref()
-        .map(|v| caps_to_mask(v))
-        .unwrap_or(0);
-    let permitted = capabilities
-        .permitted()
-        .as_ref()
-        .map(|v| caps_to_mask(v))
-        .unwrap_or(0);
-    let inheritable = capabilities
-        .inheritable()
-        .as_ref()
-        .map(|v| caps_to_mask(v))
-        .unwrap_or(0);
+    // 2. Set effective/permitted/inheritable via capset(2) (only if any are specified)
+    let has_cap_sets = capabilities.effective().is_some()
+        || capabilities.permitted().is_some()
+        || capabilities.inheritable().is_some();
 
-    set_caps(effective, permitted, inheritable)?;
+    if has_cap_sets {
+        // If a set is not specified, default to all caps (don't restrict)
+        let all_caps: u64 = (1u64 << (CAP_LAST_CAP + 1)) - 1;
+        let effective = capabilities
+            .effective()
+            .as_ref()
+            .map(|v| caps_to_mask(v))
+            .unwrap_or(all_caps);
+        let permitted = capabilities
+            .permitted()
+            .as_ref()
+            .map(|v| caps_to_mask(v))
+            .unwrap_or(all_caps);
+        let inheritable = capabilities
+            .inheritable()
+            .as_ref()
+            .map(|v| caps_to_mask(v))
+            .unwrap_or(0); // inheritable defaults to empty
+
+        set_caps(effective, permitted, inheritable)?;
+    }
 
     // 3. Set ambient capabilities
     if let Some(ambient) = capabilities.ambient() {
@@ -150,10 +156,7 @@ pub fn apply_capabilities(spec: &Spec) -> Result<()> {
         }
     }
 
-    debug!(
-        "capabilities applied: bounding={:#x} effective={:#x} permitted={:#x} inheritable={:#x}",
-        bounding, effective, permitted, inheritable
-    );
+    debug!("capabilities applied");
 
     Ok(())
 }

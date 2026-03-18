@@ -11,8 +11,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+
+      - name: Clone rust-extensions
+        run: git clone --depth 1 https://github.com/containerd/rust-extensions.git ../rust-extensions
 
       - uses: dtolnay/rust-toolchain@stable
         with:

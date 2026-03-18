@@ -171,7 +171,8 @@ pub fn create_container(
 
     debug!("create_container: forked middle process pid={}", pid);
 
-    // Read the grandchild (init) PID from the pid pipe
+    // Read the grandchild (init) PID from the pid pipe.
+    // The middle process writes this then exits immediately.
     let mut pid_buf = [0u8; 32];
     let mut pid_file_inner = unsafe { fs::File::from_raw_fd(pid_rd.as_raw_fd()) };
     std::mem::forget(pid_rd);
@@ -186,7 +187,10 @@ pub fn create_container(
 
     debug!("create_container: grandchild (init) pid={}", init_pid);
 
-    // Wait for child to signal ready (or error)
+    // Reap the middle process (it exited immediately after writing the PID)
+    unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+
+    // Wait for grandchild to signal ready (or error)
     let mut ready_buf = [0u8; 1];
     let mut ready_file = unsafe { fs::File::from_raw_fd(ready_rd.as_raw_fd()) };
     // Prevent double-close
@@ -252,23 +256,15 @@ fn child_setup(
         return Err(other!("double-fork failed: {}", std::io::Error::last_os_error()));
     }
     if grandchild_pid > 0 {
-        // Middle process: write grandchild PID to parent, then wait for grandchild
+        // Middle process: write grandchild PID to parent, then exit immediately.
+        // The grandchild gets reparented to the shim (subreaper), so the shim's
+        // process monitor can waitpid on it directly and detect container exit.
         let pid_str = grandchild_pid.to_string();
         let _ = nix::unistd::write(&pid_pipe_wr, pid_str.as_bytes());
         drop(pid_pipe_wr);
         drop(init_pipe_rd);
         drop(ready_pipe_wr);
-
-        let mut status = 0i32;
-        unsafe { libc::waitpid(grandchild_pid, &mut status, 0) };
-        let code = if libc::WIFEXITED(status) {
-            libc::WEXITSTATUS(status)
-        } else if libc::WIFSIGNALED(status) {
-            128 + libc::WTERMSIG(status)
-        } else {
-            1
-        };
-        unsafe { libc::_exit(code) };
+        unsafe { libc::_exit(0) };
     }
 
     // === GRANDCHILD — now PID 1 in the new PID namespace ===

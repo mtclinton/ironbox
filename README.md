@@ -21,7 +21,7 @@ Container creation uses `fork(2)`, `unshare(2)`, `pivot_root(2)`, and `mount(2)`
 
 | Operation | Implementation |
 |-----------|---------------|
-| **create** | Native &mdash; double-fork, `unshare` namespaces, `pivot_root`, OCI mounts, cgroup v2 setup, capability drop, loopback up |
+| **create** | Native &mdash; double-fork, `unshare` namespaces, `pivot_root`, OCI mounts, cgroup v2, capabilities, seccomp, uid/gid, loopback |
 | **start** | Native &mdash; writes to sync pipe, init process (PID 1) execs the entrypoint |
 | **kill** | Native &mdash; `kill(2)` syscall with process group support |
 | **delete** | Native &mdash; kills cgroup processes, removes cgroup, unmounts rootfs |
@@ -107,7 +107,6 @@ This runs ~15 tests covering basic execution, PID namespace, cgroups, filesystem
 ## Known limitations
 
 - **Console/PTY** &mdash; `ctr run -t` (interactive terminal mode) is not yet supported. Non-terminal stdio works.
-- **Seccomp** &mdash; No seccomp filter support. Containers run without syscall filtering.
 - **AppArmor/SELinux** &mdash; No mandatory access control profile support.
 - **User namespaces** &mdash; Rootless containers are not supported.
 - **Networking** &mdash; Only loopback is configured. Bridge/veth networking depends on CNI plugins (external to the runtime).
@@ -129,8 +128,9 @@ Some ways to contribute include:
 - **Phase 2**: Custom `IronboxFactory`/`IronboxContainer` types with native signal handling, cgroup management, and process listing.
 - **Phase 3**: Fully native OCI runtime &mdash; container create/start/delete/exec use Linux syscalls directly, no runc binary required.
 - **Phase 4**: Hardening &mdash; cgroup v2 resource limits, PID 1 via double-fork, capability dropping, loopback networking.
-- **Phase 5** (current): Integration tests, CI, exec support, release.
-- **Phase 6**: Seccomp filters, AppArmor/SELinux profiles, console/PTY support.
+- **Phase 5**: Integration tests, CI, exec support, release.
+- **Phase 6** (current): Seccomp filters, uid/gid switching, self-contained builds, release binaries.
+- **Phase 7**: Console/PTY support, AppArmor/SELinux profiles.
 
 ## Dependencies
 

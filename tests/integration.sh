@@ -101,6 +101,16 @@ echo ""
 echo "Capabilities:"
 run_test "cap-status"    "CapBnd"      sh -c "cat /proc/self/status | grep Cap"
 
+# --- User/Group ---
+echo ""
+echo "User/Group:"
+run_test "uid-root"      "uid=0"       id
+
+# --- Seccomp ---
+echo ""
+echo "Seccomp:"
+run_test "seccomp-status" "Seccomp"    sh -c "cat /proc/self/status | grep Seccomp"
+
 # --- Long-running + kill ---
 echo ""
 echo "Lifecycle:"

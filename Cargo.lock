@@ -107,6 +107,7 @@ dependencies = [
 [[package]]
 name = "containerd-shim"
 version = "0.8.0"
+source = "git+https://github.com/mtclinton/rust-extensions.git?rev=220d6d6#220d6d6a65aacb855084edf3832707b5c03749e6"
 dependencies = [
  "async-trait",
  "cgroups-rs",
@@ -135,6 +136,7 @@ dependencies = [
 [[package]]
 name = "containerd-shim-protos"
 version = "0.8.0"
+source = "git+https://github.com/mtclinton/rust-extensions.git?rev=220d6d6#220d6d6a65aacb855084edf3832707b5c03749e6"
 dependencies = [
  "async-trait",
  "protobuf",

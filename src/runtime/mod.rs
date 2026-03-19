@@ -6,3 +6,4 @@ pub mod io;
 pub mod namespace;
 pub mod network;
 pub mod rootfs;
+pub mod seccomp;

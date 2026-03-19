@@ -23,6 +23,7 @@ use super::{
     namespace::setup_namespaces,
     network::setup_loopback,
     rootfs::{cleanup_rootfs, pivot_root, setup_default_devices, setup_mounts, setup_rootfs},
+    seccomp::apply_seccomp,
 };
 
 /// Stdio paths (named FIFOs) for the container process.
@@ -313,6 +314,29 @@ fn grandchild_setup(
 
     // Drop capabilities per OCI spec
     apply_capabilities(spec)?;
+
+    // Apply seccomp filter (must be after caps, before uid/gid switch)
+    apply_seccomp(spec)?;
+
+    // Switch user/group IDs per OCI spec (must be after caps and seccomp — they need root)
+    if let Some(process) = spec.process() {
+        let user = process.user();
+        // Set supplementary groups first (requires root)
+        if let Some(groups) = user.additional_gids() {
+            let gids: Vec<nix::unistd::Gid> = groups
+                .iter()
+                .map(|&g| nix::unistd::Gid::from_raw(g))
+                .collect();
+            nix::unistd::setgroups(&gids)
+                .map_err(|e| other!("setgroups: {}", e))?;
+        }
+        let gid = nix::unistd::Gid::from_raw(user.gid());
+        nix::unistd::setresgid(gid, gid, gid)
+            .map_err(|e| other!("setresgid {}: {}", user.gid(), e))?;
+        let uid = nix::unistd::Uid::from_raw(user.uid());
+        nix::unistd::setresuid(uid, uid, uid)
+            .map_err(|e| other!("setresuid {}: {}", user.uid(), e))?;
+    }
 
     // Signal parent that setup is complete
     let _ = nix::unistd::write(&ready_pipe_wr, b"R");

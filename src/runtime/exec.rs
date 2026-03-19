@@ -197,6 +197,20 @@ fn exec_child_setup(
         }
     }
 
+    // Switch user/group if specified in process spec
+    let user = process.user();
+    if let Some(groups) = user.additional_gids() {
+        let gids: Vec<nix::unistd::Gid> = groups
+            .iter()
+            .map(|&g| nix::unistd::Gid::from_raw(g))
+            .collect();
+        let _ = nix::unistd::setgroups(&gids);
+    }
+    let gid = nix::unistd::Gid::from_raw(user.gid());
+    let _ = nix::unistd::setresgid(gid, gid, gid);
+    let uid = nix::unistd::Uid::from_raw(user.uid());
+    let _ = nix::unistd::setresuid(uid, uid, uid);
+
     // Exec
     let args = process
         .args()

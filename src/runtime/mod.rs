@@ -1,5 +1,7 @@
+pub mod apparmor;
 pub mod capabilities;
 pub mod cgroup;
+pub mod checkpoint;
 pub mod container;
 pub mod exec;
 pub mod io;
@@ -7,3 +9,4 @@ pub mod namespace;
 pub mod network;
 pub mod rootfs;
 pub mod seccomp;
+pub mod selinux;

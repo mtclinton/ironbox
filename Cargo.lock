@@ -106,8 +106,9 @@ dependencies = [
 
 [[package]]
 name = "containerd-shim"
-version = "0.8.0"
-source = "git+https://github.com/mtclinton/rust-extensions.git?rev=220d6d6#220d6d6a65aacb855084edf3832707b5c03749e6"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b16da01f5ea209d00a0a53342a748491e2b50b1d8cfa96e0c5c5f262f3dd270"
 dependencies = [
  "async-trait",
  "cgroups-rs",
@@ -126,6 +127,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "signal-hook",
+ "tempfile",
  "thiserror 2.0.18",
  "time",
  "tokio",
@@ -135,8 +137,9 @@ dependencies = [
 
 [[package]]
 name = "containerd-shim-protos"
-version = "0.8.0"
-source = "git+https://github.com/mtclinton/rust-extensions.git?rev=220d6d6#220d6d6a65aacb855084edf3832707b5c03749e6"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de174e763d62b6b1aaed7d9ec7f21369e18d4f4098ae1f11f2ea1a3eb4a31c61"
 dependencies = [
  "async-trait",
  "protobuf",
@@ -594,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "ironbox"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "cgroups-rs",
@@ -1446,10 +1449,10 @@ dependencies = [
 
 [[package]]
 name = "ttrpc-codegen"
-version = "0.5.0"
-source = "git+https://github.com/containerd/ttrpc-rust?rev=4929e9079941e7ead82fae3911340f8cbe810e7e#4929e9079941e7ead82fae3911340f8cbe810e7e"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e5c657ef5cea6f6c6073c1be0787ba4482f42a569d4821e467daec795271f86"
 dependencies = [
- "home",
  "protobuf",
  "protobuf-codegen",
  "protobuf-support",
@@ -1458,11 +1461,11 @@ dependencies = [
 
 [[package]]
 name = "ttrpc-compiler"
-version = "0.7.0"
-source = "git+https://github.com/containerd/ttrpc-rust?rev=4929e9079941e7ead82fae3911340f8cbe810e7e#4929e9079941e7ead82fae3911340f8cbe810e7e"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3aa71f4a44711b3b9cc10ed0c7e239ff0fe4b8e6c900a142fb3bb26401385718"
 dependencies = [
  "derive-new",
- "home",
  "prost",
  "prost-build",
  "prost-types",

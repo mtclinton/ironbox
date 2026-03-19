@@ -55,18 +55,17 @@ src/
 > [!NOTE]
 > ironbox requires a running [containerd](https://containerd.io/) daemon. No external OCI runtime (runc, crun, etc.) is needed.
 
-### Build and install
+### Install from crates.io
+
+```shell
+cargo install ironbox
+```
+
+### Build from source
 
 ```shell
 make build
 sudo make install
-```
-
-Or manually:
-
-```shell
-cargo build --release
-sudo cp target/release/containerd-shim-ironbox-v1 /usr/local/bin/
 ```
 
 ### Run a container
@@ -107,9 +106,9 @@ This runs ~15 tests covering basic execution, PID namespace, cgroups, filesystem
 ## Known limitations
 
 - **Console/PTY** &mdash; `ctr run -t` (interactive terminal mode) is not yet supported. Non-terminal stdio works.
-- **AppArmor/SELinux** &mdash; No mandatory access control profile support.
 - **User namespaces** &mdash; Rootless containers are not supported.
 - **Networking** &mdash; Only loopback is configured. Bridge/veth networking depends on CNI plugins (external to the runtime).
+- **Checkpoint/restore** &mdash; Requires `criu` binary installed on the host.
 
 ## How do I contribute?
 
@@ -129,8 +128,8 @@ Some ways to contribute include:
 - **Phase 3**: Fully native OCI runtime &mdash; container create/start/delete/exec use Linux syscalls directly, no runc binary required.
 - **Phase 4**: Hardening &mdash; cgroup v2 resource limits, PID 1 via double-fork, capability dropping, loopback networking.
 - **Phase 5**: Integration tests, CI, exec support, release.
-- **Phase 6** (current): Seccomp filters, uid/gid switching, self-contained builds, release binaries.
-- **Phase 7**: Console/PTY support, AppArmor/SELinux profiles.
+- **Phase 6**: Seccomp filters, uid/gid switching, self-contained builds, release binaries.
+- **Phase 7** (current): AppArmor/SELinux profiles, checkpoint/restore (CRIU), containerd-shim 0.10.0, crates.io publishing.
 
 ## Dependencies
 

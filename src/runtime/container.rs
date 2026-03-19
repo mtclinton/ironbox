@@ -18,12 +18,14 @@ use nix::{
 use oci_spec::runtime::Spec;
 
 use super::{
+    apparmor::apply_apparmor,
     capabilities::apply_capabilities,
     cgroup::{add_process_to_cgroup, create_cgroup, delete_cgroup},
     namespace::setup_namespaces,
     network::setup_loopback,
     rootfs::{cleanup_rootfs, pivot_root, setup_default_devices, setup_mounts, setup_rootfs},
     seccomp::apply_seccomp,
+    selinux::apply_selinux,
 };
 
 /// Stdio paths (named FIFOs) for the container process.
@@ -318,7 +320,11 @@ fn grandchild_setup(
     // Apply seccomp filter (must be after caps, before uid/gid switch)
     apply_seccomp(spec)?;
 
-    // Switch user/group IDs per OCI spec (must be after caps and seccomp — they need root)
+    // Apply AppArmor/SELinux profiles (sets label for next exec)
+    apply_apparmor(spec)?;
+    apply_selinux(spec)?;
+
+    // Switch user/group IDs per OCI spec (must be last — can't do anything privileged after)
     if let Some(process) = spec.process() {
         let user = process.user();
         // Set supplementary groups first (requires root)

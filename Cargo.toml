@@ -1,16 +1,20 @@
 [package]
 name = "ironbox"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
-description = "A containerd shim runtime built in Rust"
+description = "A native containerd shim OCI runtime built in Rust — no runc dependency"
 license = "Apache-2.0"
+repository = "https://github.com/mtclinton/ironbox"
+readme = "README.md"
+keywords = ["container", "runtime", "containerd", "oci", "linux"]
+categories = ["os::linux-apis", "command-line-utilities"]
 
 [[bin]]
 name = "containerd-shim-ironbox-v1"
 path = "src/main.rs"
 
 [dependencies]
-containerd-shim = { git = "https://github.com/mtclinton/rust-extensions.git", rev = "220d6d6", version = "0.8.0", features = ["async"] }
+containerd-shim = { version = "0.10.0", features = ["async"] }
 
 libc = "0.2"
 log = { version = "0.4", features = ["std", "kv_unstable"] }
